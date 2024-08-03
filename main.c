@@ -16,16 +16,24 @@ const char test_json[] =
 "\"Goodbye\":100,\n"
 "\"Weehee\":10.433,\n"
 "\"Obj\":{\"new\":\"ci\", \"old\":{\"a\":1, \"b\":2}},\n"
-"\"Arr\":[0, 1, \"2\", \"three\", 4.0]\n"
-"\"Arr\":[0, 1, [2, 3, 4], \"2\", \"three\", 4.0, {\"Me\":5, \"You\": \"6.0\", \"Them\":[0, 1, \"2\"]}]\n"
+"\"Arr\":[0, 1, [2, 3, 4], {\"Hi\": \"Bye\"}, \"2\", \"three\", 4.0, {\"Me\":5, \"You\": \"6.0\", \"Them\":[0, 1, \"2\"]}]\n"
 "}";
 
 //TODO:
-//  - Validate
-//      - No duplicate keys
-//  - Access members
+//  - Change obj representation
+//      - Hash map and list
+//  - Quality pass on parse code
+//  - More parse error info
+//  - Be smarter about searching keys in objects
+//  - Handle parsing in N-page size pieces
+//  - Token array vs on demand
+//      - Have tokeniser store pointer to token array of arbitrary length, on-demand is token array of one
+//  - Security
+//      - No everlasting json text
 //  - Stress test
 //  - Perf test
+
+// =========================== Tokens ======================= //
 
 u32 is_letter(char c)
 {
@@ -72,6 +80,8 @@ typedef struct
     u32  len;
 } string;
 
+string null_str = {NULL, 0};
+
 void print_string(string s)
 {
     printf("%.*s", s.len, s.cstr);
@@ -113,6 +123,18 @@ string init_static_string(const char *cstr, u32 len)
     s.cstr = cstr;
 
     return s;
+}
+
+u32 string_eq(string s0, string s1)
+{
+    if(s0.len != s1.len) return 0;
+
+    for(u32 i = 0; i < s0.len; i += 1)
+    {
+        if(s0.cstr[i] != s1.cstr[i]) return 0;
+    }
+
+    return 1;
 }
 
 typedef enum
@@ -317,6 +339,8 @@ json_token lookahead_json_token(json_tokeniser *tokeniser)
     return t;
 }
 
+// =================== Types ================== //
+
 typedef struct json_obj json_obj;
 
 typedef enum
@@ -339,6 +363,20 @@ typedef struct
         json_obj *obj;
     };
 } json_val;
+
+typedef struct
+{
+    string   name;
+    json_val value;
+} json_pair;
+
+//Obj with pairs with no names is an array
+struct json_obj
+{
+    u32 num_pairs;
+    json_pair *pairs;
+};
+typedef json_obj json_arr;
 
 void print_json_val(json_val *val)
 {
@@ -367,12 +405,6 @@ void print_json_val(json_val *val)
     }
 }
 
-typedef struct
-{
-    string   name;
-    json_val value;
-} json_pair;
-
 void print_json_pair(json_pair *p)
 {
     print_string(p->name);
@@ -380,12 +412,91 @@ void print_json_pair(json_pair *p)
     print_json_val(&p->value);
 }
 
-//Obj with pairs with no names is an array
-struct json_obj
+u32 json_obj_has(json_obj *obj, string key)
 {
-    u32 num_pairs;
-    json_pair *pairs;
-};
+    for(u32 i = 0; i < obj->num_pairs; i += 1)
+    {
+        if(string_eq(obj->pairs[i].name, key)) return 1;
+    }
+    return 0;
+}
+
+json_val get_json_val(json_obj *obj, string key)
+{
+    json_val val = {};
+    for(u32 i = 0; i < obj->num_pairs; i += 1)
+    {
+        if(string_eq(obj->pairs[i].name, key))
+        {
+            val = obj->pairs[i].value;
+        }
+    }
+    return val;
+}
+
+json_val get_arr_element(json_arr *arr, u32 index)
+{
+    return arr->pairs[index].value;
+}
+
+f64 get_num_val(json_obj *obj, string key)
+{
+    json_val v = get_json_val(obj, key);
+    return v.num;
+}
+
+string get_str_val(json_obj *obj, string key)
+{
+    json_val v = get_json_val(obj, key);
+    return v.str;
+}
+
+json_obj *get_json_obj(json_obj *obj, string key)
+{
+    json_val v = get_json_val(obj, key);
+    return v.obj;
+}
+
+json_arr *get_json_arr(json_obj *obj, string key)
+{
+    return get_json_obj(obj, key);
+}
+
+void insert_num_val(json_obj *obj, string key, f64 num)
+{
+    json_pair *dst_pair = &obj->pairs[obj->num_pairs];
+    dst_pair->name = key;
+    dst_pair->value.type = JSON_NUM;
+    dst_pair->value.num = num;
+    obj->num_pairs += 1;
+}
+
+void insert_str_val(json_obj *obj, string key, string str)
+{
+    json_pair *dst_pair = &obj->pairs[obj->num_pairs];
+    dst_pair->name = key;
+    dst_pair->value.type = JSON_STR;
+    dst_pair->value.str = str;
+    obj->num_pairs += 1;
+}
+
+void insert_json_obj(json_obj *obj, string key, json_obj *val)
+{
+    json_pair *dst_pair = &obj->pairs[obj->num_pairs];
+    dst_pair->name = key;
+    dst_pair->value.type = JSON_OBJ;
+    dst_pair->value.obj = val;
+    obj->num_pairs += 1;
+}
+
+void insert_json_arr(json_obj *obj, string key, json_arr *arr)
+{
+    json_pair *dst_pair = &obj->pairs[obj->num_pairs];
+    dst_pair->name = key;
+    dst_pair->value.type = JSON_ARR;
+    dst_pair->value.obj = arr;
+    obj->num_pairs += 1;
+}
 
 typedef struct
 {
@@ -414,6 +525,8 @@ json_obj *add_json_obj(json_obj_list *obj_list)
     return obj;
 }
 
+// ========================== Parsing ============================== //
+
 void json_parse_error(json_token *t)
 {
     printf("PARSE ERROR AT ");
@@ -430,7 +543,7 @@ void count_arr_vals(json_obj_list *obj_list, json_tokeniser *jt)
     if(t.type != TOKEN_OBRACK) json_parse_error(&t);
 
     json_obj *parent = add_json_obj(obj_list);
-    for(; t.type != TOKEN_CBRACK && t.type != TOKEN_END; t = next_json_token(jt))
+    for(; t.type != TOKEN_CBRACK;)
     {
         json_token lh = lookahead_json_token(jt);
         if(lh.type == TOKEN_OBRACE)
@@ -453,6 +566,14 @@ void count_arr_vals(json_obj_list *obj_list, json_tokeniser *jt)
             }
         }
 
+        t = next_json_token(jt);
+        if(t.type == TOKEN_COMMA)
+        {
+            lh = lookahead_json_token(jt);
+            if(lh.type == TOKEN_CBRACK) json_parse_error(&t);
+        }
+        else if(t.type != TOKEN_CBRACK) json_parse_error(&t);
+
         parent->num_pairs += 1;
     }
 }
@@ -464,7 +585,7 @@ void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt)
 
     json_obj *parent = add_json_obj(obj_list);
     //For each pair in obj
-    for(t = next_json_token(jt); t.type != TOKEN_CBRACE && t.type != TOKEN_END; t = next_json_token(jt))
+    for(t = next_json_token(jt); t.type != TOKEN_CBRACE; t = next_json_token(jt))
     {
         if(t.type != TOKEN_WORD) json_parse_error(&t);
         t = next_json_token(jt);
@@ -491,7 +612,14 @@ void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt)
         }
 
         lh = lookahead_json_token(jt);
-        if(lh.type == TOKEN_COMMA) t = next_json_token(jt);
+        if(lh.type == TOKEN_COMMA)
+        {
+            t = next_json_token(jt);
+            lh = lookahead_json_token(jt);
+            
+            //t must be TOKEN_COMMA here
+            if(lh.type == TOKEN_CBRACE) json_parse_error(&t);
+        }
 
         parent->num_pairs += 1;
     }
@@ -517,7 +645,6 @@ u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
     json_token t = next_json_token(jt); //OBRACK
 
     json_obj *dst = &obj_list->objs[parsed_objs];
-    json_pair *dst_pair = &dst->pairs[0];
     parsed_objs += 1;
 
     for(; t.type != TOKEN_CBRACK; t = next_json_token(jt))
@@ -525,14 +652,12 @@ u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
         json_token lh = lookahead_json_token(jt);
         if(lh.type == TOKEN_OBRACE)
         {
-            dst_pair->value.type = JSON_OBJ;
-            dst_pair->value.obj = &obj_list->objs[parsed_objs];
+            insert_json_obj(dst, null_str, &obj_list->objs[parsed_objs]);
             parsed_objs = parse_json_obj(jt, obj_list, parsed_objs);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
-            dst_pair->value.type = JSON_ARR;
-            dst_pair->value.obj = &obj_list->objs[parsed_objs];
+            insert_json_arr(dst, null_str, &obj_list->objs[parsed_objs]);
             parsed_objs = parse_json_arr(jt, obj_list, parsed_objs);
         }
         else
@@ -542,21 +667,16 @@ u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
             {
                 case TOKEN_WORD:
                 {
-                    dst_pair->value.type = JSON_STR;
-                    dst_pair->value.str = init_string(t.loc, t.len);
+                    insert_str_val(dst, null_str, init_string(t.loc, t.len));
                     break;
                 }
                 case TOKEN_NUMBER:
                 {
-                    dst_pair->value.type = JSON_NUM;
-                    dst_pair->value.num = t.num_val;
+                    insert_num_val(dst, null_str, t.num_val);
                     break;
                 }
             }
         }
-
-        dst->num_pairs += 1;
-        dst_pair += 1;
     }
 
     return parsed_objs;
@@ -567,26 +687,24 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
     json_token t = next_json_token(jt); //OBRACE
 
     json_obj *dst = &obj_list->objs[parsed_objs];
-    json_pair *dst_pair = &dst->pairs[0];
     parsed_objs += 1;
     for(t = next_json_token(jt); t.type != TOKEN_CBRACE; t = next_json_token(jt))
     {
         //t = WORD
-        dst_pair->name = init_string(t.loc, t.len);
+        string pair_name = init_string(t.loc+1, t.len-2);
+        if(json_obj_has(dst, pair_name)) json_parse_error(&t);
 
         t = next_json_token(jt); //COLON
 
         json_token lh = lookahead_json_token(jt); //lh value
         if(lh.type == TOKEN_OBRACE)
         {
-            dst_pair->value.type = JSON_OBJ;
-            dst_pair->value.obj = &obj_list->objs[parsed_objs];
+            insert_json_obj(dst, pair_name, &obj_list->objs[parsed_objs]);
             parsed_objs = parse_json_obj(jt, obj_list, parsed_objs);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
-            dst_pair->value.type = JSON_ARR;
-            dst_pair->value.obj = &obj_list->objs[parsed_objs];
+            insert_json_arr(dst, pair_name, &obj_list->objs[parsed_objs]);
             parsed_objs = parse_json_arr(jt, obj_list, parsed_objs);
         }
         else
@@ -596,14 +714,12 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
             {
                 case TOKEN_WORD:
                 {
-                    dst_pair->value.type = JSON_STR;
-                    dst_pair->value.str = init_string(t.loc, t.len);
+                    insert_str_val(dst, pair_name, init_string(t.loc, t.len));
                     break;
                 }
                 case TOKEN_NUMBER:
                 {
-                    dst_pair->value.type = JSON_NUM;
-                    dst_pair->value.num = t.num_val;
+                    insert_num_val(dst, pair_name, t.num_val);
                     break;
                 }
             }
@@ -611,9 +727,6 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
 
         lh = lookahead_json_token(jt);
         if(lh.type == TOKEN_COMMA) t = next_json_token(jt);
-
-        dst->num_pairs += 1;
-        dst_pair += 1;
     }
 
     return parsed_objs;
@@ -643,10 +756,13 @@ void parse_json(const char *json, u32 json_len, json_obj_list *obj_list)
     parse_json_obj(&jt, obj_list, 0);
 }
 
+// ============================== Printing =========================== //
+
 typedef struct
 {
     u32 pairs_left;
-    json_val_type type;
+    u32 indent;
+    json_val_type scope_type;
     json_obj *obj;
 } json_stack_entry;
 
@@ -656,12 +772,13 @@ typedef struct
     json_stack_entry *stack;
 } json_print_stack;
 
-void push_jps(json_print_stack *stack, json_obj *obj, json_val_type type)
+void push_jps(json_print_stack *stack, json_obj *obj, json_val_type type, u32 indent)
 {
     json_stack_entry *dst = &stack->stack[stack->size];
     dst->pairs_left = obj->num_pairs;
     dst->obj = obj;
-    dst->type = type;
+    dst->scope_type = type;
+    dst->indent = indent;
     stack->size += 1;
 }
 
@@ -678,7 +795,7 @@ json_stack_entry *top_jps(json_print_stack *stack)
 
 void print_indent(u32 indent)
 {
-    for(u32 i = 0; i < indent; i += 1) printf("  ");
+    for(u32 i = 0; i < indent; i += 1) printf(" ");
 }
 
 void print_parsed_json(json_obj_list *json)
@@ -686,97 +803,72 @@ void print_parsed_json(json_obj_list *json)
     json_print_stack stack;
     stack.size = 0;
     stack.stack = malloc(json->num_objs * sizeof(json_stack_entry));
-    push_jps(&stack, &json->objs[0], JSON_OBJ);
-    
-    json_val_type prev_type = JSON_OBJ;
-    u32 indent = 0;
+    push_jps(&stack, &json->objs[0], JSON_OBJ, 0);
+
     printf("{\n");
+    u32 obj_ended = 0;
+    u32 indent_len = 2;
     while(stack.size > 0)
     {
         json_stack_entry *t = top_jps(&stack);
+        json_val_type scope = t->scope_type;
         json_pair *pair = &(t->obj->pairs[t->obj->num_pairs - t->pairs_left]);
         json_val_type val_type = pair->value.type;
-        json_val_type current_type = t->type;
         
-        if(t->pairs_left == 0)
+        if(scope == JSON_OBJ || (obj_ended == 1 && scope == JSON_ARR)) print_indent(t->indent);
+        if(t->pairs_left > 0)
         {
-            pop_jps(&stack);
-            t = top_jps(&stack);
-            if(current_type == JSON_OBJ)
+            if(scope == JSON_OBJ)
             {
-                print_indent(indent);
-                printf("}");
-                if(stack.size > 0 && t->pairs_left > 1) printf(",");
-                printf("\n");
-                prev_type = JSON_OBJ;
+                printf("\"");
+                print_string(pair->name);
+                printf("\":");
             }
-            else if(current_type == JSON_ARR)
-            {
-                if(prev_type == JSON_OBJ)
-                print_indent(indent);
-
-                printf("]");
-                if(stack.size > 0 && t->pairs_left > 1) printf(",");
-                printf("\n");
-                prev_type = JSON_ARR;
-            }
-            if(stack.size > 0)
-            {
-                t->pairs_left -= 1;
-            }
-            indent -= 1;
-        }
-        else
-        {
             if(val_type == JSON_OBJ)
             {
-                push_jps(&stack, pair->value.obj, JSON_OBJ);
-
-                if(current_type == JSON_OBJ)
-                {
-                    print_indent(indent);
-                    print_string(pair->name);
-                    printf(":");
-                }
                 printf("{\n");
-
-                current_type = JSON_OBJ;
-                indent += 1;
+                push_jps(&stack, pair->value.obj, JSON_OBJ, t->indent + indent_len);
             }
             else if(val_type == JSON_ARR)
             {
-                push_jps(&stack, pair->value.obj, JSON_ARR);
-
-                if(current_type == JSON_OBJ)
-                {
-                    print_indent(indent);
-                    print_string(pair->name);
-                    printf(":");
-                }
                 printf("[");
-                current_type = JSON_ARR;
-                indent += 1;
+                push_jps(&stack, pair->value.obj, JSON_ARR, t->indent + pair->name.len + 1);
             }
             else
             {
-                if(current_type == JSON_OBJ) 
-                {
-                    print_indent(indent);
-                    print_json_pair(pair);
-                    if(t->pairs_left > 1) printf(",");
-                    printf("\n");
-                }
-                else if(current_type == JSON_ARR)
-                {
-                    print_json_val(&pair->value);
-                    if(t->pairs_left > 1) printf(",");
-                    prev_type = val_type;
-                }
+                print_json_val(&pair->value);
                 t->pairs_left -= 1;
+                if(t->pairs_left > 0) printf(",");
+                if(scope == JSON_OBJ) printf("\n");
+            }
+            obj_ended = 0;
+        }
+        else
+        {
+            if(scope == JSON_OBJ) 
+            {
+                printf("}");
+                obj_ended = 1;
+            }
+            else if(scope == JSON_ARR) 
+            {
+                printf("]");
+                obj_ended = 0;
+            }
+
+            pop_jps(&stack);
+            if(stack.size > 0)
+            {
+                t = top_jps(&stack);
+                t->pairs_left -= 1;
+                if(t->pairs_left > 0) printf(",");
+                if(scope == JSON_OBJ || t->scope_type == JSON_OBJ) printf("\n");
             }
         }
     }
 }
+
+// =============================================================== //
 
 int main()
 {
@@ -826,6 +918,11 @@ int main()
     }
     printf("Parsed JSON:\n");
     print_parsed_json(&obj_list);
+
+    printf("\nLooking for Hello\n");
+    json_val val = get_json_val(&obj_list.objs[0], init_static_cstring("Hello"));
+    print_json_val(&val);
+    printf("\n");
 
     return 0;
 }
