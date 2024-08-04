@@ -2,7 +2,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
+typedef uint8_t  byte;
 typedef uint32_t u32;
 typedef int32_t  s32;
 typedef uint64_t u64;
@@ -20,18 +23,72 @@ const char test_json[] =
 "}";
 
 //TODO:
-//  - Change obj representation
-//      - Hash map and list
+//  - Tokeniser w/ array
+//  - Obj rep
+//      - Hash map w/ pair list for ordering
+//      - Hash map entries contain space for key-value pairs
+//  - What's using so much memory?
+//      - Before token array and obj rep change, 17kb being used (wha?!)
 //  - Quality pass on parse code
-//  - More parse error info
-//  - Be smarter about searching keys in objects
-//  - Handle parsing in N-page size pieces
-//  - Token array vs on demand
-//      - Have tokeniser store pointer to token array of arbitrary length, on-demand is token array of one
-//  - Security
-//      - No everlasting json text
-//  - Stress test
-//  - Perf test
+//      - More parse error info
+//      - Better perf?
+//  - Security and performance
+
+// =========================== Arena ==========================//
+
+//Reserve some number of pages, commit some number of pages and extend when out of capacity
+typedef struct
+{
+    u32 page_size;
+    u32 reserved;
+    u32 committed;
+    u32 allocated;
+    byte *buffer;
+} mem_arena;
+
+void print_arena_info(mem_arena *arena)
+{
+    printf("Base = %p, Reserved = %u, Committed = %u, Allocated = %u\n",
+            arena->buffer, arena->reserved, arena->committed, arena->allocated);
+}
+
+void commit_mem(mem_arena *arena, u32 commit_size)
+{
+    byte *base = arena->buffer + arena->committed;
+    commit_size = (commit_size + (arena->page_size - 1)) & ~(arena->page_size - 1);
+    VirtualAlloc(base, commit_size, MEM_COMMIT, PAGE_READWRITE);
+    arena->committed += commit_size;
+}
+
+void init_mem_arena(mem_arena *arena, u32 reserve_size, u32 page_size)
+{
+    //Init mem_arena struct and reserve reserve_size bytes
+    arena->buffer = (byte*)VirtualAlloc(NULL, reserve_size, MEM_RESERVE, PAGE_READWRITE);
+    arena->page_size = page_size;
+    arena->reserved = reserve_size;
+    arena->committed = 0;
+    arena->allocated = 0;
+}
+
+byte *alloc(mem_arena *arena, u32 alloc_size)
+{
+    u32 new_allocated = arena->allocated + alloc_size;
+    //NOTE: rn this works on page size
+    if(new_allocated > arena->committed)
+    {
+        printf("DOiNG\n");
+        u32 to_commit = new_allocated - arena->committed;
+        commit_mem(arena, to_commit);
+    }
+    byte *ptr = arena->buffer + arena->allocated;
+    arena->allocated += alloc_size;
+    return ptr;
+}
+
+void unalloc(mem_arena *arena, u32 unalloc_size)
+{
+    arena->allocated -= unalloc_size;
+}
 
 // =========================== Tokens ======================= //
 
@@ -87,21 +144,21 @@ void print_string(string s)
     printf("%.*s", s.len, s.cstr);
 }
 
-string init_cstring(const char *cstr)
+string init_cstring(const char *cstr, mem_arena *arena)
 {
     string s;
     s.len  = strlen(cstr);
-    s.cstr = malloc(s.len);
+    s.cstr = alloc(arena, s.len);
     memcpy(s.cstr, cstr, s.len);
 
     return s;
 }
 
-string init_string(const char *cstr, u32 len)
+string init_string(const char *cstr, u32 len, mem_arena *arena)
 {
     string s;
     s.len = len;
-    s.cstr = malloc(s.len);
+    s.cstr = alloc(arena, s.len);
     memcpy(s.cstr, cstr, s.len);
 
     return s;
@@ -625,22 +682,22 @@ void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt)
     }
 }
 
-json_obj_list count_json_objs(const char *json, u32 json_len)
+json_obj_list count_json_objs(const char *json, u32 json_len, mem_arena *arena)
 {
     json_tokeniser jt;
     init_json_tokeniser(&jt, json, json_len);
 
     json_obj_list obj_list = {};
     obj_list.capacity = 1024;
-    obj_list.objs = malloc(obj_list.capacity * sizeof(json_obj));
+    obj_list.objs = (json_obj*)alloc(arena, obj_list.capacity * sizeof(json_obj));
     count_obj_pairs(&obj_list, &jt);
 
     return obj_list;
 }
 
-u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs);
+u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs, mem_arena *arena);
 
-u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
+u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs, mem_arena *arena)
 {
     json_token t = next_json_token(jt); //OBRACK
 
@@ -653,12 +710,12 @@ u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
         if(lh.type == TOKEN_OBRACE)
         {
             insert_json_obj(dst, null_str, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_obj(jt, obj_list, parsed_objs);
+            parsed_objs = parse_json_obj(jt, obj_list, parsed_objs, arena);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
             insert_json_arr(dst, null_str, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_arr(jt, obj_list, parsed_objs);
+            parsed_objs = parse_json_arr(jt, obj_list, parsed_objs, arena);
         }
         else
         {
@@ -667,7 +724,7 @@ u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
             {
                 case TOKEN_WORD:
                 {
-                    insert_str_val(dst, null_str, init_string(t.loc, t.len));
+                    insert_str_val(dst, null_str, init_string(t.loc, t.len, arena));
                     break;
                 }
                 case TOKEN_NUMBER:
@@ -682,7 +739,7 @@ u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
     return parsed_objs;
 }
 
-u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
+u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs, mem_arena *arena)
 {
     json_token t = next_json_token(jt); //OBRACE
 
@@ -691,7 +748,7 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
     for(t = next_json_token(jt); t.type != TOKEN_CBRACE; t = next_json_token(jt))
     {
         //t = WORD
-        string pair_name = init_string(t.loc+1, t.len-2);
+        string pair_name = init_string(t.loc+1, t.len-2, arena);
         if(json_obj_has(dst, pair_name)) json_parse_error(&t);
 
         t = next_json_token(jt); //COLON
@@ -700,12 +757,12 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
         if(lh.type == TOKEN_OBRACE)
         {
             insert_json_obj(dst, pair_name, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_obj(jt, obj_list, parsed_objs);
+            parsed_objs = parse_json_obj(jt, obj_list, parsed_objs, arena);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
             insert_json_arr(dst, pair_name, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_arr(jt, obj_list, parsed_objs);
+            parsed_objs = parse_json_arr(jt, obj_list, parsed_objs, arena);
         }
         else
         {
@@ -714,7 +771,7 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
             {
                 case TOKEN_WORD:
                 {
-                    insert_str_val(dst, pair_name, init_string(t.loc, t.len));
+                    insert_str_val(dst, pair_name, init_string(t.loc, t.len, arena));
                     break;
                 }
                 case TOKEN_NUMBER:
@@ -732,14 +789,14 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs)
     return parsed_objs;
 }
 
-void parse_json(const char *json, u32 json_len, json_obj_list *obj_list)
+void parse_json(const char *json, u32 json_len, json_obj_list *obj_list, mem_arena *arena)
 {
     u32 total_pairs = 0;
     for(u32 o = 0; o < obj_list->num_objs; o += 1)
     {
         total_pairs += obj_list->objs[o].num_pairs;
     }
-    json_pair *pair_buffer = malloc(total_pairs * sizeof(json_pair));
+    json_pair *pair_buffer = (json_pair*)alloc(arena, total_pairs * sizeof(json_pair));
 
     u32 p = 0;
     for(u32 o = 0; o < obj_list->num_objs; o += 1)
@@ -753,7 +810,7 @@ void parse_json(const char *json, u32 json_len, json_obj_list *obj_list)
     json_tokeniser jt;
     init_json_tokeniser(&jt, json, json_len);
 
-    parse_json_obj(&jt, obj_list, 0);
+    parse_json_obj(&jt, obj_list, 0, arena);
 }
 
 // ============================== Printing =========================== //
@@ -798,11 +855,12 @@ void print_indent(u32 indent)
     for(u32 i = 0; i < indent; i += 1) printf(" ");
 }
 
-void print_parsed_json(json_obj_list *json)
+void print_parsed_json(json_obj_list *json, mem_arena *arena)
 {
+    u32 stack_capacity = json->num_objs * sizeof(json_stack_entry);
     json_print_stack stack;
     stack.size = 0;
-    stack.stack = malloc(json->num_objs * sizeof(json_stack_entry));
+    stack.stack = (json_stack_entry*)alloc(arena, stack_capacity);
     push_jps(&stack, &json->objs[0], JSON_OBJ, 0);
 
     printf("{\n");
@@ -872,6 +930,9 @@ void print_parsed_json(json_obj_list *json)
 
 int main()
 {
+    mem_arena arena;
+    init_mem_arena(&arena, 32768, 4096);
+
     const char *cstr = "\"Hello\": 10.0\n";
     string hw = init_static_cstring(cstr);
     print_string(hw);
@@ -892,7 +953,7 @@ int main()
     printf("\n");
 
     printf("Counting...\n");
-    json_obj_list obj_list = count_json_objs(json, json_len);
+    json_obj_list obj_list = count_json_objs(json, json_len, &arena);
     printf("Counted.\n");
     printf("Num objs: %u\n", obj_list.num_objs);
     printf("Pairs[0]: %u\n", obj_list.objs[0].num_pairs);
@@ -901,7 +962,7 @@ int main()
     printf("Pairs[3]: %u\n", obj_list.objs[3].num_pairs);
 
     printf("Parsing...\n");
-    parse_json(json, json_len, &obj_list);
+    parse_json(json, json_len, &obj_list, &arena);
     printf("Parsed.\n");
 
     printf("\n");
@@ -917,12 +978,12 @@ int main()
         printf("\n");
     }
     printf("Parsed JSON:\n");
-    print_parsed_json(&obj_list);
+    print_parsed_json(&obj_list, &arena);
 
     printf("\nLooking for Hello\n");
     json_val val = get_json_val(&obj_list.objs[0], init_static_cstring("Hello"));
     print_json_val(&val);
     printf("\n");
-
+    print_arena_info(&arena);
     return 0;
 }
