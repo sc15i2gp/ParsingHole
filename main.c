@@ -25,12 +25,6 @@ const char test_json[] =
 //TODO:
 //  - Test json 165 bytes of data (string, numerical, obj pointers), with 1 token and 8 objs allocated 1499 bytes used
 //      - With mem arena, don't need to have an obj list capacity, unreserve mem once parsed
-//  - Don't store array contents as pairs
-//      - Pass parsed_json through count and parse functions for ease
-//      - Pass ptrs to parsed_objs and parsed_arrs
-//      - Populating obj_list and arr_list
-//      - Printing
-//      - Eventually store all values together and all keys together
 //  - Obj rep
 //      - Hash map w/ pair list for ordering
 //      - Hash map entries contain space for key-value pairs
@@ -76,6 +70,14 @@ void init_mem_arena(mem_arena *arena, u32 reserve_size, u32 page_size)
     arena->buffer = (byte*)VirtualAlloc(NULL, reserve_size, MEM_RESERVE, PAGE_READWRITE);
     arena->page_size = page_size;
     arena->reserved = reserve_size;
+    arena->committed = 0;
+    arena->allocated = 0;
+}
+
+void delete_mem_arena(mem_arena *arena)
+{
+    VirtualFree(arena->buffer, 0, MEM_RELEASE);
+    arena->reserved = 0;
     arena->committed = 0;
     arena->allocated = 0;
 }
@@ -958,6 +960,11 @@ parsed_json parse_json(const char *json, u32 json_len)
     return ret_json;
 }
 
+void dealloc_parsed_json(parsed_json *json)
+{
+    delete_mem_arena(&json->mem);
+}
+
 // ============================== Printing =========================== //
 
 typedef struct
@@ -1119,6 +1126,8 @@ int main()
     json_val val = get_json_val(&p_json.objs.objs[0], init_static_cstring("Hello"));
     print_json_val(&val);
     printf("\n");
+    print_arena_info(&p_json.mem);
+    dealloc_parsed_json(&p_json);
     print_arena_info(&p_json.mem);
     return 0;
 }
