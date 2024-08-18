@@ -23,16 +23,21 @@ const char test_json[] =
 "}";
 
 //TODO:
-//  - Tokeniser w/ array
+//  - Test json 165 bytes of data (string, numerical, obj pointers), with 1 token and 8 objs allocated 1499 bytes used
+//      - With mem arena, don't need to have an obj list capacity, unreserve mem once parsed
+//  - Don't store array contents as pairs
 //  - Obj rep
 //      - Hash map w/ pair list for ordering
 //      - Hash map entries contain space for key-value pairs
-//  - What's using so much memory?
-//      - Before token array and obj rep change, 17kb being used (wha?!)
+//  - Repetition testing
 //  - Quality pass on parse code
 //      - More parse error info
 //      - Better perf?
 //  - Security and performance
+//  - Use cases
+//      - CI error log retrieval
+//      - JSON manipulation (insertion, deletion etc.)
+//      - Pretty printing
 
 // =========================== Arena ==========================//
 
@@ -76,7 +81,6 @@ byte *alloc(mem_arena *arena, u32 alloc_size)
     //NOTE: rn this works on page size
     if(new_allocated > arena->committed)
     {
-        printf("DOiNG\n");
         u32 to_commit = new_allocated - arena->committed;
         commit_mem(arena, to_commit);
     }
@@ -212,8 +216,8 @@ typedef enum
 typedef struct
 {
     json_token_type type;
-    const char *loc;
     u32 len;
+    const char *loc;
     f64 num_val;
 } json_token;
 
@@ -362,26 +366,55 @@ typedef struct
     const char *src_end;
 
     const char *src_loc;
+    u32 token_array_capacity;
+    u32 token_array_length;
+    u32 tokens_read;
+    json_token *token_array;
 } json_tokeniser;
 
-void init_json_tokeniser(json_tokeniser *tokeniser, const char *src, u32 src_len)
+void init_json_tokeniser(json_tokeniser *tokeniser, const char *src, u32 src_len, u32 capacity, mem_arena *arena)
 {
     tokeniser->src_begin = src;
     tokeniser->src_end   = src + src_len;
     tokeniser->src_loc   = src;
+
+    tokeniser->token_array_capacity = capacity;
+    tokeniser->token_array_length = 0;
+    tokeniser->tokens_read = 0;
+    tokeniser->token_array = (json_token*)alloc(arena, capacity * sizeof(json_token));
+}
+
+void reset_json_tokeniser(json_tokeniser *tokeniser)
+{
+    tokeniser->src_loc = tokeniser->src_begin;
+    tokeniser->token_array_length = 0;
+    tokeniser->tokens_read = 0;
 }
 
 json_token next_json_token(json_tokeniser *tokeniser)
 {
-    json_token t;
+    if(tokeniser->tokens_read == tokeniser->token_array_length)
+    {
+        u32 t_len = 0;
+        json_token *t;
+        do
+        {
+            const char *loc = tokeniser->src_loc;
+            const char *end = tokeniser->src_end;
+            t = &tokeniser->token_array[t_len];
+            read_json_token(t, loc, end);
+            t_len += 1;
+            tokeniser->src_loc = t->loc + t->len;
+        }
+        while((t_len < tokeniser->token_array_capacity) && (t->type != TOKEN_END));
+        tokeniser->tokens_read = 0;
+        tokeniser->token_array_length = t_len;
+    }
 
-    const char *loc = tokeniser->src_loc;
-    const char *end = tokeniser->src_end;
+    json_token *t = &tokeniser->token_array[tokeniser->tokens_read];
+    tokeniser->tokens_read += 1;
 
-    read_json_token(&t, loc, end);
-    tokeniser->src_loc = t.loc + t.len;
-
-    return t;
+    return *t;
 }
 
 json_token lookahead_json_token(json_tokeniser *tokeniser)
@@ -391,7 +424,14 @@ json_token lookahead_json_token(json_tokeniser *tokeniser)
     const char *loc = tokeniser->src_loc;
     const char *end = tokeniser->src_end;
 
-    read_json_token(&t, loc, end);
+    if(tokeniser->tokens_read == tokeniser->token_array_length)
+    {
+        read_json_token(&t, loc, end);
+    }
+    else
+    {
+        t = tokeniser->token_array[tokeniser->tokens_read];
+    }
 
     return t;
 }
@@ -682,15 +722,12 @@ void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt)
     }
 }
 
-json_obj_list count_json_objs(const char *json, u32 json_len, mem_arena *arena)
+json_obj_list count_json_objs(json_tokeniser *jt, mem_arena *arena)
 {
-    json_tokeniser jt;
-    init_json_tokeniser(&jt, json, json_len);
-
     json_obj_list obj_list = {};
-    obj_list.capacity = 1024;
+    obj_list.capacity = 8;
     obj_list.objs = (json_obj*)alloc(arena, obj_list.capacity * sizeof(json_obj));
-    count_obj_pairs(&obj_list, &jt);
+    count_obj_pairs(&obj_list, jt);
 
     return obj_list;
 }
@@ -789,13 +826,14 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs,
     return parsed_objs;
 }
 
-void parse_json(const char *json, u32 json_len, json_obj_list *obj_list, mem_arena *arena)
+void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, mem_arena *arena)
 {
     u32 total_pairs = 0;
     for(u32 o = 0; o < obj_list->num_objs; o += 1)
     {
         total_pairs += obj_list->objs[o].num_pairs;
     }
+    printf("Size: %u %u\n", total_pairs, sizeof(json_pair));
     json_pair *pair_buffer = (json_pair*)alloc(arena, total_pairs * sizeof(json_pair));
 
     u32 p = 0;
@@ -807,10 +845,28 @@ void parse_json(const char *json, u32 json_len, json_obj_list *obj_list, mem_are
         obj->num_pairs = 0;
     }
 
-    json_tokeniser jt;
-    init_json_tokeniser(&jt, json, json_len);
+    parse_json_obj(jt, obj_list, 0, arena);
+}
 
-    parse_json_obj(&jt, obj_list, 0, arena);
+typedef struct
+{
+    mem_arena mem;
+    json_obj_list objs;
+} parsed_json;
+
+parsed_json parse_json(const char *json, u32 json_len)
+{
+    parsed_json ret_json;
+    init_mem_arena(&ret_json.mem, 2*1024*1024, 4096);
+
+    json_tokeniser jt;
+    init_json_tokeniser(&jt, json, json_len, 1, &ret_json.mem);
+
+    ret_json.objs = count_json_objs(&jt, &ret_json.mem);
+    reset_json_tokeniser(&jt);
+    parse_json_objs(&jt, &ret_json.objs, &ret_json.mem);
+
+    return ret_json;
 }
 
 // ============================== Printing =========================== //
@@ -855,8 +911,10 @@ void print_indent(u32 indent)
     for(u32 i = 0; i < indent; i += 1) printf(" ");
 }
 
-void print_parsed_json(json_obj_list *json, mem_arena *arena)
+void print_parsed_json(parsed_json *p_json)
 {
+    json_obj_list *json = &p_json->objs;
+    mem_arena *arena = &p_json->mem;
     u32 stack_capacity = json->num_objs * sizeof(json_stack_entry);
     json_print_stack stack;
     stack.size = 0;
@@ -930,9 +988,6 @@ void print_parsed_json(json_obj_list *json, mem_arena *arena)
 
 int main()
 {
-    mem_arena arena;
-    init_mem_arena(&arena, 32768, 4096);
-
     const char *cstr = "\"Hello\": 10.0\n";
     string hw = init_static_cstring(cstr);
     print_string(hw);
@@ -940,35 +995,10 @@ int main()
     const char *json = test_json;
     u32 json_len = strlen(json);
 
-    json_tokeniser jt;
-    init_json_tokeniser(&jt, json, json_len);
-
-    json_token t;
-    for(t = next_json_token(&jt); t.type != TOKEN_END; t = next_json_token(&jt))
+    parsed_json p_json = parse_json(json, json_len);
+    for(u32 o = 0; o < p_json.objs.num_objs; o += 1)
     {
-        print_json_token(&t);
-    }
-    printf("\n");
-    print_json_token(&t);
-    printf("\n");
-
-    printf("Counting...\n");
-    json_obj_list obj_list = count_json_objs(json, json_len, &arena);
-    printf("Counted.\n");
-    printf("Num objs: %u\n", obj_list.num_objs);
-    printf("Pairs[0]: %u\n", obj_list.objs[0].num_pairs);
-    printf("Pairs[1]: %u\n", obj_list.objs[1].num_pairs);
-    printf("Pairs[2]: %u\n", obj_list.objs[2].num_pairs);
-    printf("Pairs[3]: %u\n", obj_list.objs[3].num_pairs);
-
-    printf("Parsing...\n");
-    parse_json(json, json_len, &obj_list, &arena);
-    printf("Parsed.\n");
-
-    printf("\n");
-    for(u32 o = 0; o < obj_list.num_objs; o += 1)
-    {
-        json_obj *obj = &obj_list.objs[o];
+        json_obj *obj = &p_json.objs.objs[o];
         printf("Obj[%u] %p Num pairs %u:\n", o, obj, obj->num_pairs);
         for(u32 p = 0; p < obj->num_pairs; p += 1)
         {
@@ -978,12 +1008,11 @@ int main()
         printf("\n");
     }
     printf("Parsed JSON:\n");
-    print_parsed_json(&obj_list, &arena);
-
+    print_parsed_json(&p_json);
     printf("\nLooking for Hello\n");
-    json_val val = get_json_val(&obj_list.objs[0], init_static_cstring("Hello"));
+    json_val val = get_json_val(&p_json.objs.objs[0], init_static_cstring("Hello"));
     print_json_val(&val);
     printf("\n");
-    print_arena_info(&arena);
+    print_arena_info(&p_json.mem);
     return 0;
 }
