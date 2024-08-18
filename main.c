@@ -26,6 +26,11 @@ const char test_json[] =
 //  - Test json 165 bytes of data (string, numerical, obj pointers), with 1 token and 8 objs allocated 1499 bytes used
 //      - With mem arena, don't need to have an obj list capacity, unreserve mem once parsed
 //  - Don't store array contents as pairs
+//      - Pass parsed_json through count and parse functions for ease
+//      - Pass ptrs to parsed_objs and parsed_arrs
+//      - Populating obj_list and arr_list
+//      - Printing
+//      - Eventually store all values together and all keys together
 //  - Obj rep
 //      - Hash map w/ pair list for ordering
 //      - Hash map entries contain space for key-value pairs
@@ -439,6 +444,7 @@ json_token lookahead_json_token(json_tokeniser *tokeniser)
 // =================== Types ================== //
 
 typedef struct json_obj json_obj;
+typedef struct json_arr json_arr;
 
 typedef enum
 {
@@ -458,6 +464,7 @@ typedef struct
         f64      num;
         string   str;
         json_obj *obj;
+        json_arr *arr;
     };
 } json_val;
 
@@ -473,7 +480,26 @@ struct json_obj
     u32 num_pairs;
     json_pair *pairs;
 };
-typedef json_obj json_arr;
+
+struct json_arr
+{
+    u32 num_elements;
+    json_val *elements;
+};
+
+typedef struct
+{
+    u32 capacity;
+    u32 num_objs;
+    json_obj *objs;
+} json_obj_list;
+
+typedef struct
+{
+    u32 capacity;
+    u32 num_arrs;
+    json_arr *arrs;
+} json_arr_list;
 
 void print_json_val(json_val *val)
 {
@@ -533,7 +559,7 @@ json_val get_json_val(json_obj *obj, string key)
 
 json_val get_arr_element(json_arr *arr, u32 index)
 {
-    return arr->pairs[index].value;
+    return arr->elements[index];
 }
 
 f64 get_num_val(json_obj *obj, string key)
@@ -556,10 +582,11 @@ json_obj *get_json_obj(json_obj *obj, string key)
 
 json_arr *get_json_arr(json_obj *obj, string key)
 {
-    return get_json_obj(obj, key);
+    json_val v = get_json_val(obj, key);
+    return v.arr;
 }
 
-void insert_num_val(json_obj *obj, string key, f64 num)
+void insert_num_val_obj(json_obj *obj, string key, f64 num)
 {
     json_pair *dst_pair = &obj->pairs[obj->num_pairs];
     dst_pair->name = key;
@@ -568,7 +595,7 @@ void insert_num_val(json_obj *obj, string key, f64 num)
     obj->num_pairs += 1;
 }
 
-void insert_str_val(json_obj *obj, string key, string str)
+void insert_str_val_obj(json_obj *obj, string key, string str)
 {
     json_pair *dst_pair = &obj->pairs[obj->num_pairs];
     dst_pair->name = key;
@@ -577,7 +604,7 @@ void insert_str_val(json_obj *obj, string key, string str)
     obj->num_pairs += 1;
 }
 
-void insert_json_obj(json_obj *obj, string key, json_obj *val)
+void insert_json_obj_obj(json_obj *obj, string key, json_obj *val)
 {
     json_pair *dst_pair = &obj->pairs[obj->num_pairs];
     dst_pair->name = key;
@@ -586,21 +613,46 @@ void insert_json_obj(json_obj *obj, string key, json_obj *val)
     obj->num_pairs += 1;
 }
 
-void insert_json_arr(json_obj *obj, string key, json_arr *arr)
+void insert_json_arr_obj(json_obj *obj, string key, json_arr *arr)
 {
     json_pair *dst_pair = &obj->pairs[obj->num_pairs];
     dst_pair->name = key;
     dst_pair->value.type = JSON_ARR;
-    dst_pair->value.obj = arr;
+    dst_pair->value.arr = arr;
     obj->num_pairs += 1;
 }
 
-typedef struct
+void insert_num_val_arr(json_arr *arr, f64 num)
 {
-    u32 capacity;
-    u32 num_objs;
-    json_obj *objs;
-} json_obj_list;
+    json_val *dst_val = &arr->elements[arr->num_elements];
+    arr->num_elements += 1;
+    dst_val->type = JSON_NUM;
+    dst_val->num  = num;
+}
+
+void insert_str_val_arr(json_arr *arr, string str)
+{
+    json_val *dst_val = &arr->elements[arr->num_elements];
+    arr->num_elements += 1;
+    dst_val->type = JSON_STR;
+    dst_val->str  = str;
+}
+
+void insert_json_obj_arr(json_arr *arr, json_obj *val)
+{
+    json_val *dst_val = &arr->elements[arr->num_elements];
+    arr->num_elements += 1;
+    dst_val->type = JSON_OBJ;
+    dst_val->obj = val;
+}
+
+void insert_json_arr_arr(json_arr *arr, json_arr *val)
+{   
+    json_val *dst_val = &arr->elements[arr->num_elements];
+    arr->num_elements += 1;
+    dst_val->type = JSON_ARR;
+    dst_val->arr = val;
+}
 
 json_obj *add_json_obj(json_obj_list *obj_list)
 {
@@ -622,6 +674,26 @@ json_obj *add_json_obj(json_obj_list *obj_list)
     return obj;
 }
 
+json_arr *add_json_arr(json_arr_list *arr_list)
+{
+    u32 num_arrs = arr_list->num_arrs;
+    u32 capacity = arr_list->capacity;
+    json_arr *arrs = arr_list->arrs;
+    if(num_arrs == capacity)
+    {
+        //TODO
+    }
+    json_arr *arr = &arrs[num_arrs];
+    arr->num_elements = 0;
+    arr->elements = NULL;
+
+    arr_list->capacity = capacity;
+    arr_list->num_arrs = num_arrs + 1;
+    arr_list->arrs = arrs;
+
+    return arr;
+}
+
 // ========================== Parsing ============================== //
 
 void json_parse_error(json_token *t)
@@ -632,24 +704,24 @@ void json_parse_error(json_token *t)
     exit(-1);
 }
 
-void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt);
+void count_obj_pairs(json_obj_list *obj_list, json_arr_list *arr_list, json_tokeniser *jt);
 
-void count_arr_vals(json_obj_list *obj_list, json_tokeniser *jt)
+void count_arr_vals(json_obj_list *obj_list, json_arr_list *arr_list, json_tokeniser *jt)
 {
     json_token t = next_json_token(jt);
     if(t.type != TOKEN_OBRACK) json_parse_error(&t);
 
-    json_obj *parent = add_json_obj(obj_list);
+    json_arr *parent = add_json_arr(arr_list);
     for(; t.type != TOKEN_CBRACK;)
     {
         json_token lh = lookahead_json_token(jt);
         if(lh.type == TOKEN_OBRACE)
         {
-            count_obj_pairs(obj_list, jt);
+            count_obj_pairs(obj_list, arr_list, jt);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
-            count_arr_vals(obj_list, jt);
+            count_arr_vals(obj_list, arr_list, jt);
         }
         else
         {
@@ -671,11 +743,11 @@ void count_arr_vals(json_obj_list *obj_list, json_tokeniser *jt)
         }
         else if(t.type != TOKEN_CBRACK) json_parse_error(&t);
 
-        parent->num_pairs += 1;
+        parent->num_elements += 1;
     }
 }
 
-void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt)
+void count_obj_pairs(json_obj_list *obj_list, json_arr_list *arr_list, json_tokeniser *jt)
 {
     json_token t = next_json_token(jt);
     if(t.type != TOKEN_OBRACE) json_parse_error(&t);
@@ -690,11 +762,11 @@ void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt)
         json_token lh = lookahead_json_token(jt);
         if(lh.type == TOKEN_OBRACE)
         {
-            count_obj_pairs(obj_list, jt);
+            count_obj_pairs(obj_list, arr_list, jt);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
-            count_arr_vals(obj_list, jt);
+            count_arr_vals(obj_list, arr_list, jt);
         }
         else
         {
@@ -722,37 +794,38 @@ void count_obj_pairs(json_obj_list *obj_list, json_tokeniser *jt)
     }
 }
 
-json_obj_list count_json_objs(json_tokeniser *jt, mem_arena *arena)
+void count_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, mem_arena *arena)
 {
-    json_obj_list obj_list = {};
-    obj_list.capacity = 8;
-    obj_list.objs = (json_obj*)alloc(arena, obj_list.capacity * sizeof(json_obj));
-    count_obj_pairs(&obj_list, jt);
-
-    return obj_list;
+    obj_list->num_objs = 0;
+    obj_list->capacity = 16;
+    obj_list->objs = (json_obj*)alloc(arena, obj_list->capacity * sizeof(json_obj));
+    arr_list->num_arrs = 0;
+    arr_list->capacity = 16;
+    arr_list->arrs = (json_arr*)alloc(arena, arr_list->capacity * sizeof(json_arr));
+    count_obj_pairs(obj_list, arr_list, jt);
 }
 
-u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs, mem_arena *arena);
+void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, mem_arena *arena);
 
-u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs, mem_arena *arena)
+void parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, mem_arena *arena)
 {
     json_token t = next_json_token(jt); //OBRACK
 
-    json_obj *dst = &obj_list->objs[parsed_objs];
-    parsed_objs += 1;
+    json_arr *dst = &arr_list->arrs[*parsed_arrs];
+    *parsed_arrs += 1;
 
     for(; t.type != TOKEN_CBRACK; t = next_json_token(jt))
     {
         json_token lh = lookahead_json_token(jt);
         if(lh.type == TOKEN_OBRACE)
         {
-            insert_json_obj(dst, null_str, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_obj(jt, obj_list, parsed_objs, arena);
+            insert_json_obj_arr(dst, &obj_list->objs[*parsed_objs]);
+            parse_json_obj(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
-            insert_json_arr(dst, null_str, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_arr(jt, obj_list, parsed_objs, arena);
+            insert_json_arr_arr(dst, &arr_list->arrs[*parsed_arrs]);
+            parse_json_arr(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
         }
         else
         {
@@ -761,27 +834,25 @@ u32 parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs,
             {
                 case TOKEN_WORD:
                 {
-                    insert_str_val(dst, null_str, init_string(t.loc, t.len, arena));
+                    insert_str_val_arr(dst, init_string(t.loc, t.len, arena));
                     break;
                 }
                 case TOKEN_NUMBER:
                 {
-                    insert_num_val(dst, null_str, t.num_val);
+                    insert_num_val_arr(dst, t.num_val);
                     break;
                 }
             }
         }
     }
-
-    return parsed_objs;
 }
 
-u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs, mem_arena *arena)
+void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, mem_arena *arena)
 {
     json_token t = next_json_token(jt); //OBRACE
 
-    json_obj *dst = &obj_list->objs[parsed_objs];
-    parsed_objs += 1;
+    json_obj *dst = &obj_list->objs[*parsed_objs];
+    *parsed_objs += 1;
     for(t = next_json_token(jt); t.type != TOKEN_CBRACE; t = next_json_token(jt))
     {
         //t = WORD
@@ -793,13 +864,13 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs,
         json_token lh = lookahead_json_token(jt); //lh value
         if(lh.type == TOKEN_OBRACE)
         {
-            insert_json_obj(dst, pair_name, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_obj(jt, obj_list, parsed_objs, arena);
+            insert_json_obj_obj(dst, pair_name, &obj_list->objs[*parsed_objs]);
+            parse_json_obj(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
-            insert_json_arr(dst, pair_name, &obj_list->objs[parsed_objs]);
-            parsed_objs = parse_json_arr(jt, obj_list, parsed_objs, arena);
+            insert_json_arr_obj(dst, pair_name, &arr_list->arrs[*parsed_arrs]);
+            parse_json_arr(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
         }
         else
         {
@@ -808,12 +879,12 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs,
             {
                 case TOKEN_WORD:
                 {
-                    insert_str_val(dst, pair_name, init_string(t.loc, t.len, arena));
+                    insert_str_val_obj(dst, pair_name, init_string(t.loc, t.len, arena));
                     break;
                 }
                 case TOKEN_NUMBER:
                 {
-                    insert_num_val(dst, pair_name, t.num_val);
+                    insert_num_val_obj(dst, pair_name, t.num_val);
                     break;
                 }
             }
@@ -822,11 +893,9 @@ u32 parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, u32 parsed_objs,
         lh = lookahead_json_token(jt);
         if(lh.type == TOKEN_COMMA) t = next_json_token(jt);
     }
-
-    return parsed_objs;
 }
 
-void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, mem_arena *arena)
+void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, mem_arena *arena)
 {
     u32 total_pairs = 0;
     for(u32 o = 0; o < obj_list->num_objs; o += 1)
@@ -835,6 +904,14 @@ void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, mem_arena *are
     }
     printf("Size: %u %u\n", total_pairs, sizeof(json_pair));
     json_pair *pair_buffer = (json_pair*)alloc(arena, total_pairs * sizeof(json_pair));
+
+    u32 total_elements = 0;
+    for(u32 o = 0; o < arr_list->num_arrs; o += 1)
+    {
+        total_elements += arr_list->arrs[o].num_elements;
+    }
+    printf("Size: %u %u\n", total_elements, sizeof(json_val));
+    json_val *arr_buffer = (json_val*)alloc(arena, total_elements * sizeof(json_val));
 
     u32 p = 0;
     for(u32 o = 0; o < obj_list->num_objs; o += 1)
@@ -845,13 +922,25 @@ void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, mem_arena *are
         obj->num_pairs = 0;
     }
 
-    parse_json_obj(jt, obj_list, 0, arena);
+    p = 0;
+    for(u32 o = 0; o < arr_list->num_arrs; o += 1)
+    {
+        json_arr *arr = &arr_list->arrs[o];
+        arr->elements = &arr_buffer[p];
+        p += arr->num_elements;
+        arr->num_elements = 0;
+    }
+
+    u32 s = 0;
+    u32 t = 0;
+    parse_json_obj(jt, obj_list, arr_list, &s, &t, arena);
 }
 
 typedef struct
 {
     mem_arena mem;
     json_obj_list objs;
+    json_arr_list arrs;
 } parsed_json;
 
 parsed_json parse_json(const char *json, u32 json_len)
@@ -862,9 +951,9 @@ parsed_json parse_json(const char *json, u32 json_len)
     json_tokeniser jt;
     init_json_tokeniser(&jt, json, json_len, 1, &ret_json.mem);
 
-    ret_json.objs = count_json_objs(&jt, &ret_json.mem);
+    count_json_objs(&jt, &ret_json.objs, &ret_json.arrs, &ret_json.mem);
     reset_json_tokeniser(&jt);
-    parse_json_objs(&jt, &ret_json.objs, &ret_json.mem);
+    parse_json_objs(&jt, &ret_json.objs, &ret_json.arrs, &ret_json.mem);
 
     return ret_json;
 }
@@ -877,6 +966,7 @@ typedef struct
     u32 indent;
     json_val_type scope_type;
     json_obj *obj;
+    json_arr *arr;
 } json_stack_entry;
 
 typedef struct
@@ -885,11 +975,21 @@ typedef struct
     json_stack_entry *stack;
 } json_print_stack;
 
-void push_jps(json_print_stack *stack, json_obj *obj, json_val_type type, u32 indent)
+void push_jps_obj(json_print_stack *stack, json_obj *obj, json_val_type type, u32 indent)
 {
     json_stack_entry *dst = &stack->stack[stack->size];
     dst->pairs_left = obj->num_pairs;
     dst->obj = obj;
+    dst->scope_type = type;
+    dst->indent = indent;
+    stack->size += 1;
+}
+
+void push_jps_arr(json_print_stack *stack, json_arr *arr, json_val_type type, u32 indent)
+{
+    json_stack_entry *dst = &stack->stack[stack->size];
+    dst->pairs_left = arr->num_elements;
+    dst->arr = arr;
     dst->scope_type = type;
     dst->indent = indent;
     stack->size += 1;
@@ -913,23 +1013,29 @@ void print_indent(u32 indent)
 
 void print_parsed_json(parsed_json *p_json)
 {
-    json_obj_list *json = &p_json->objs;
+    json_obj_list *objs = &p_json->objs;
+    json_arr_list *arrs = &p_json->arrs;
     mem_arena *arena = &p_json->mem;
-    u32 stack_capacity = json->num_objs * sizeof(json_stack_entry);
+
+    u32 stack_capacity = (objs->num_objs+arrs->num_arrs) * sizeof(json_stack_entry);
+
     json_print_stack stack;
     stack.size = 0;
     stack.stack = (json_stack_entry*)alloc(arena, stack_capacity);
-    push_jps(&stack, &json->objs[0], JSON_OBJ, 0);
+    push_jps_obj(&stack, &objs->objs[0], JSON_OBJ, 0);
 
     printf("{\n");
     u32 obj_ended = 0;
     u32 indent_len = 2;
+
+    string empty_str = {};
     while(stack.size > 0)
     {
         json_stack_entry *t = top_jps(&stack);
         json_val_type scope = t->scope_type;
-        json_pair *pair = &(t->obj->pairs[t->obj->num_pairs - t->pairs_left]);
-        json_val_type val_type = pair->value.type;
+        string *val_name = (scope == JSON_OBJ) ? &(t->obj->pairs[t->obj->num_pairs - t->pairs_left].name) : &empty_str;
+        json_val *val = (scope == JSON_OBJ) ? &(t->obj->pairs[t->obj->num_pairs - t->pairs_left].value) : &(t->arr->elements[t->arr->num_elements - t->pairs_left]);
+        json_val_type val_type = val->type;
         
         if(scope == JSON_OBJ || (obj_ended == 1 && scope == JSON_ARR)) print_indent(t->indent);
         if(t->pairs_left > 0)
@@ -937,22 +1043,22 @@ void print_parsed_json(parsed_json *p_json)
             if(scope == JSON_OBJ)
             {
                 printf("\"");
-                print_string(pair->name);
+                print_string(*val_name);
                 printf("\":");
             }
             if(val_type == JSON_OBJ)
             {
                 printf("{\n");
-                push_jps(&stack, pair->value.obj, JSON_OBJ, t->indent + indent_len);
+                push_jps_obj(&stack, val->obj, JSON_OBJ, t->indent + indent_len);
             }
             else if(val_type == JSON_ARR)
             {
                 printf("[");
-                push_jps(&stack, pair->value.obj, JSON_ARR, t->indent + pair->name.len + 1);
+                push_jps_arr(&stack, val->arr, JSON_ARR, t->indent + val_name->len + 1);
             }
             else
             {
-                print_json_val(&pair->value);
+                print_json_val(val);
                 t->pairs_left -= 1;
                 if(t->pairs_left > 0) printf(",");
                 if(scope == JSON_OBJ) printf("\n");
@@ -961,12 +1067,12 @@ void print_parsed_json(parsed_json *p_json)
         }
         else
         {
-            if(scope == JSON_OBJ) 
+            if(scope == JSON_OBJ)
             {
                 printf("}");
                 obj_ended = 1;
             }
-            else if(scope == JSON_ARR) 
+            else if(scope == JSON_ARR)
             {
                 printf("]");
                 obj_ended = 0;
