@@ -9,92 +9,14 @@ typedef int64_t  s64;
 typedef float    f32;
 typedef double   f64;
 
+typedef byte* (*alloc_func)(u32);
+typedef void  (*dealloc_func)(void*, u32);
+
 typedef struct parsed_json parsed_json;
-parsed_json parse_json(const char *json, u32 json_len);
-void print_parsed_json(parsed_json *json);
-void dealloc_parsed_json(parsed_json *json);
-// =========================== Arena ==========================//
+parsed_json parse_json(const char *json, u32 json_len, alloc_func alloc);
+void print_parsed_json(parsed_json *json, alloc_func alloc, dealloc_func dealloc);
+void dealloc_parsed_json(parsed_json *json, dealloc_func dealloc);
 
-typedef struct
-{
-    u32 page_size;
-    u32 reserved;
-    u32 committed;
-    u32 allocated;
-    byte *buffer;
-} mem_arena;
-
-void print_arena_info(mem_arena *arena)
-{
-    printf("Base = %p, Reserved = %u, Committed = %u, Allocated = %u\n",
-            arena->buffer, arena->reserved, arena->committed, arena->allocated);
-}
-
-#ifdef _WIN32
-void commit_mem(mem_arena *arena, u32 commit_size)
-{
-    byte *base = arena->buffer + arena->committed;
-    commit_size = (commit_size + (arena->page_size - 1)) & ~(arena->page_size - 1);
-    VirtualAlloc(base, commit_size, MEM_COMMIT, PAGE_READWRITE);
-    arena->committed += commit_size;
-}
-#endif
-
-//Reserve some number of pages, commit some number of pages and extend when out of capacity
-void init_mem_arena(mem_arena *arena, u32 reserve_size, u32 page_size)
-{
-    //Init mem_arena struct and reserve reserve_size bytes
-    #ifdef _WIN32
-    arena->buffer = (byte*)VirtualAlloc(NULL, reserve_size, MEM_RESERVE, PAGE_READWRITE);
-    #else
-    arena->buffer = (byte*)malloc(reserve_size);
-    #endif
-    arena->page_size = page_size;
-    arena->reserved = reserve_size;
-    arena->committed = 0;
-    arena->allocated = 0;
-}
-
-void delete_mem_arena(mem_arena *arena)
-{
-    #ifdef _WIN32
-    VirtualFree(arena->buffer, 0, MEM_RELEASE);
-    #else
-    free(arena->buffer);
-    #endif
-    arena->reserved = 0;
-    arena->committed = 0;
-    arena->allocated = 0;
-}
-
-byte *alloc(mem_arena *arena, u32 alloc_size)
-{
-    u32 new_allocated = arena->allocated + alloc_size;
-    //NOTE: rn this works on page size
-    #ifdef _WIN32
-    if(new_allocated > arena->committed)
-    {
-        u32 to_commit = new_allocated - arena->committed;
-        commit_mem(arena, to_commit);
-    }
-    #else
-    if(new_allocated > arena->reserved)
-    {
-        u32 new_reserved = 2 * arena->reserved;
-        u32 to_reserve = (new_allocated > new_reserved) ? new_allocated : new_reserved;
-        arena->buffer = realloc(arena->buffer, to_reserve);
-        arena->reserved = to_reserve;
-    }
-    #endif
-    byte *ptr = arena->buffer + arena->allocated;
-    arena->allocated += alloc_size;
-    return ptr;
-}
-
-void unalloc(mem_arena *arena, u32 unalloc_size)
-{
-    arena->allocated -= unalloc_size;
-}
 // =========================== Tokens ======================= //
 
 u32 is_letter(char c)
@@ -149,21 +71,21 @@ void print_string(string s)
     printf("%.*s", s.len, s.cstr);
 }
 
-string init_cstring(const char *cstr, mem_arena *arena)
+string init_cstring(const char *cstr, alloc_func alloc)
 {
     string s;
     s.len  = strlen(cstr);
-    s.cstr = alloc(arena, s.len);
+    s.cstr = alloc(s.len);
     memcpy(s.cstr, cstr, s.len);
 
     return s;
 }
 
-string init_string(const char *cstr, u32 len, mem_arena *arena)
+string init_string(const char *cstr, u32 len, alloc_func alloc)
 {
     string s;
     s.len = len;
-    s.cstr = alloc(arena, s.len);
+    s.cstr = alloc(s.len);
     memcpy(s.cstr, cstr, s.len);
 
     return s;
@@ -373,7 +295,7 @@ typedef struct
     json_token *token_array;
 } json_tokeniser;
 
-void init_json_tokeniser(json_tokeniser *tokeniser, const char *src, u32 src_len, u32 capacity, mem_arena *arena)
+void init_json_tokeniser(json_tokeniser *tokeniser, const char *src, u32 src_len, u32 capacity, alloc_func alloc)
 {
     tokeniser->src_begin = src;
     tokeniser->src_end   = src + src_len;
@@ -382,7 +304,7 @@ void init_json_tokeniser(json_tokeniser *tokeniser, const char *src, u32 src_len
     tokeniser->token_array_capacity = capacity;
     tokeniser->token_array_length = 0;
     tokeniser->tokens_read = 0;
-    tokeniser->token_array = (json_token*)alloc(arena, capacity * sizeof(json_token));
+    tokeniser->token_array = (json_token*)alloc(capacity * sizeof(json_token));
 }
 
 void reset_json_tokeniser(json_tokeniser *tokeniser)
@@ -790,20 +712,20 @@ void count_obj_pairs(json_obj_list *obj_list, json_arr_list *arr_list, json_toke
     }
 }
 
-void count_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, mem_arena *arena)
+void count_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, alloc_func alloc)
 {
     obj_list->num_objs = 0;
     obj_list->capacity = 16;
-    obj_list->objs = (json_obj*)alloc(arena, obj_list->capacity * sizeof(json_obj));
+    obj_list->objs = (json_obj*)alloc(obj_list->capacity * sizeof(json_obj));
     arr_list->num_arrs = 0;
     arr_list->capacity = 16;
-    arr_list->arrs = (json_arr*)alloc(arena, arr_list->capacity * sizeof(json_arr));
+    arr_list->arrs = (json_arr*)alloc(arr_list->capacity * sizeof(json_arr));
     count_obj_pairs(obj_list, arr_list, jt);
 }
 
-void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, mem_arena *arena);
+void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, alloc_func alloc);
 
-void parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, mem_arena *arena)
+void parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, alloc_func alloc)
 {
     json_token t = next_json_token(jt); //OBRACK
 
@@ -816,12 +738,12 @@ void parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *
         if(lh.type == TOKEN_OBRACE)
         {
             insert_json_obj_arr(dst, &obj_list->objs[*parsed_objs]);
-            parse_json_obj(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
+            parse_json_obj(jt, obj_list, arr_list, parsed_objs, parsed_arrs, alloc);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
             insert_json_arr_arr(dst, &arr_list->arrs[*parsed_arrs]);
-            parse_json_arr(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
+            parse_json_arr(jt, obj_list, arr_list, parsed_objs, parsed_arrs, alloc);
         }
         else
         {
@@ -830,7 +752,7 @@ void parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *
             {
                 case TOKEN_WORD:
                 {
-                    insert_str_val_arr(dst, init_string(t.loc, t.len, arena));
+                    insert_str_val_arr(dst, init_string(t.loc, t.len, alloc));
                     break;
                 }
                 case TOKEN_NUMBER:
@@ -843,7 +765,7 @@ void parse_json_arr(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *
     }
 }
 
-void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, mem_arena *arena)
+void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, u32 *parsed_objs, u32 *parsed_arrs, alloc_func alloc)
 {
     json_token t = next_json_token(jt); //OBRACE
 
@@ -852,7 +774,7 @@ void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *
     for(t = next_json_token(jt); t.type != TOKEN_CBRACE; t = next_json_token(jt))
     {
         //t = WORD
-        string pair_name = init_string(t.loc+1, t.len-2, arena);
+        string pair_name = init_string(t.loc+1, t.len-2, alloc);
         if(json_obj_has(dst, pair_name)) json_parse_error(&t);
 
         t = next_json_token(jt); //COLON
@@ -861,12 +783,12 @@ void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *
         if(lh.type == TOKEN_OBRACE)
         {
             insert_json_obj_obj(dst, pair_name, &obj_list->objs[*parsed_objs]);
-            parse_json_obj(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
+            parse_json_obj(jt, obj_list, arr_list, parsed_objs, parsed_arrs, alloc);
         }
         else if(lh.type == TOKEN_OBRACK)
         {
             insert_json_arr_obj(dst, pair_name, &arr_list->arrs[*parsed_arrs]);
-            parse_json_arr(jt, obj_list, arr_list, parsed_objs, parsed_arrs, arena);
+            parse_json_arr(jt, obj_list, arr_list, parsed_objs, parsed_arrs, alloc);
         }
         else
         {
@@ -875,7 +797,7 @@ void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *
             {
                 case TOKEN_WORD:
                 {
-                    insert_str_val_obj(dst, pair_name, init_string(t.loc, t.len, arena));
+                    insert_str_val_obj(dst, pair_name, init_string(t.loc, t.len, alloc));
                     break;
                 }
                 case TOKEN_NUMBER:
@@ -891,7 +813,7 @@ void parse_json_obj(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *
     }
 }
 
-void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, mem_arena *arena)
+void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list *arr_list, alloc_func alloc)
 {
     u32 total_pairs = 0;
     for(u32 o = 0; o < obj_list->num_objs; o += 1)
@@ -899,7 +821,7 @@ void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list 
         total_pairs += obj_list->objs[o].num_pairs;
     }
     printf("Size: %u %u\n", total_pairs, sizeof(json_pair));
-    json_pair *pair_buffer = (json_pair*)alloc(arena, total_pairs * sizeof(json_pair));
+    json_pair *pair_buffer = (json_pair*)alloc(total_pairs * sizeof(json_pair));
 
     u32 total_elements = 0;
     for(u32 o = 0; o < arr_list->num_arrs; o += 1)
@@ -907,7 +829,7 @@ void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list 
         total_elements += arr_list->arrs[o].num_elements;
     }
     printf("Size: %u %u\n", total_elements, sizeof(json_val));
-    json_val *arr_buffer = (json_val*)alloc(arena, total_elements * sizeof(json_val));
+    json_val *arr_buffer = (json_val*)alloc(total_elements * sizeof(json_val));
 
     u32 p = 0;
     for(u32 o = 0; o < obj_list->num_objs; o += 1)
@@ -929,34 +851,32 @@ void parse_json_objs(json_tokeniser *jt, json_obj_list *obj_list, json_arr_list 
 
     u32 s = 0;
     u32 t = 0;
-    parse_json_obj(jt, obj_list, arr_list, &s, &t, arena);
+    parse_json_obj(jt, obj_list, arr_list, &s, &t, alloc);
 }
 
 struct parsed_json
 {
-    mem_arena mem;
     json_obj_list objs;
     json_arr_list arrs;
 };
 
-parsed_json parse_json(const char *json, u32 json_len)
+parsed_json parse_json(const char *json, u32 json_len, alloc_func alloc)
 {
     parsed_json ret_json;
-    init_mem_arena(&ret_json.mem, 2*1024*1024, 4096);
 
     json_tokeniser jt;
-    init_json_tokeniser(&jt, json, json_len, 1, &ret_json.mem);
+    init_json_tokeniser(&jt, json, json_len, 1, alloc);
 
-    count_json_objs(&jt, &ret_json.objs, &ret_json.arrs, &ret_json.mem);
+    count_json_objs(&jt, &ret_json.objs, &ret_json.arrs, alloc);
     reset_json_tokeniser(&jt);
-    parse_json_objs(&jt, &ret_json.objs, &ret_json.arrs, &ret_json.mem);
+    parse_json_objs(&jt, &ret_json.objs, &ret_json.arrs, alloc);
 
     return ret_json;
 }
 
-void dealloc_parsed_json(parsed_json *json)
+void dealloc_parsed_json(parsed_json *json, dealloc_func dealloc)
 {
-    delete_mem_arena(&json->mem);
+    //delete_mem_arena(&json->mem);
 }
 
 // ============================== Printing =========================== //
@@ -1012,17 +932,16 @@ void print_indent(u32 indent)
     for(u32 i = 0; i < indent; i += 1) printf(" ");
 }
 
-void print_parsed_json(parsed_json *p_json)
+void print_parsed_json(parsed_json *p_json, alloc_func alloc, dealloc_func dealloc)
 {
     json_obj_list *objs = &p_json->objs;
     json_arr_list *arrs = &p_json->arrs;
-    mem_arena *arena = &p_json->mem;
 
     u32 stack_capacity = (objs->num_objs+arrs->num_arrs) * sizeof(json_stack_entry);
 
     json_print_stack stack;
     stack.size = 0;
-    stack.stack = (json_stack_entry*)alloc(arena, stack_capacity);
+    stack.stack = (json_stack_entry*)alloc(stack_capacity);
     push_jps_obj(&stack, &objs->objs[0], JSON_OBJ, 0);
 
     printf("{\n");
@@ -1091,6 +1010,7 @@ void print_parsed_json(parsed_json *p_json)
             }
         }
     }
+    dealloc(stack.stack, stack_capacity);
 }
 
 #endif
