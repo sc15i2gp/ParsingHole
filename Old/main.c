@@ -25,6 +25,7 @@ const char test_json_1[] =
 //   - Better value retrieval
 //     - Returned type from "get_json_val"
 //     - Don't have to call it multiple times for traversing nested objects/arrays
+//     - "Compound" keys (e.g. obj.field.thing[0].hello)
 //   - Handle dealloc properly
 //   - Maybe tidy up idk
 // - Stretch:
@@ -146,9 +147,9 @@ int main()
     printf("\n");
 
     printf("\nLooking for Hello...\n");
-    string key = init_static_cstring("Hello");
-    json_val val_0 = get_json_val(&p_json_0.objs.objs[0], key);
-    json_val val_1 = get_json_val(&p_json_1.objs.objs[0], key);
+    const char *key = "Hello";
+    json_val val_0 = get_json_value(&p_json_0, key);
+    json_val val_1 = get_json_value(&p_json_1, key);
     printf("Val 0:");
     print_json_val(&val_0);
     printf("\n");

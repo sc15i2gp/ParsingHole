@@ -13,9 +13,12 @@ typedef byte* (*alloc_func)(u32);
 typedef void  (*dealloc_func)(void*, u32);
 
 typedef struct parsed_json parsed_json;
+typedef struct json_val json_val;
 parsed_json parse_json(const char *json, u32 json_len, alloc_func alloc);
+json_val get_json_value(parsed_json *json, const char *key);
 void print_parsed_json(parsed_json *json, alloc_func alloc, dealloc_func dealloc);
 void dealloc_parsed_json(parsed_json *json, dealloc_func dealloc);
+
 
 // =========================== Tokens ======================= //
 
@@ -374,7 +377,7 @@ typedef enum
     JSON_TYPE_COUNT
 } json_val_type;
 
-typedef struct
+struct json_val
 {
     json_val_type type;
     union
@@ -384,7 +387,7 @@ typedef struct
         json_obj *obj;
         json_arr *arr;
     };
-} json_val;
+};
 
 typedef struct
 {
@@ -859,6 +862,14 @@ struct parsed_json
     json_obj_list objs;
     json_arr_list arrs;
 };
+
+json_val get_json_value(parsed_json *json, const char *key)
+{
+    //TODO: Nesting
+    string k_str = init_static_cstring(key);
+    json_val value = get_json_val(&json->objs.objs[0], k_str);
+    return value;
+}
 
 parsed_json parse_json(const char *json, u32 json_len, alloc_func alloc)
 {
