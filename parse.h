@@ -4,33 +4,27 @@
 #include <string.h>
 
 // JSON PARSING:
+//  - Library structure/API
+//      - Reorder structs + funcs
+//      - Make good looking public-facing API at top of header
 //  - Print parsed json
-//      - Could do better
-//      - Outer braces/brackets should be one lower indent level than object/array contents
-//      - Match closing braces/brackets to position in line with name of object/array
-//  - Strings are assumed UTF-8 - Anyone sending emoji over json is insane
+//      - Align value positions in objects (arrays already aligned)
+//      - May need additional info for neatly aligning values
+//          - Namely what the largest key in an object is
 //  - Validation
 //      - Escape characters, backslashes, no control chars in strings
 //      - Numbers in valid formats
 //      - Have tildes in error arrow cover the offending token
 //      - No duplicate keys
 //  - Tidy
-//      - Naming conventions (e.g. prefix structs with json_)
-//      - Stuff in parse state? Interfaces which don't make use of them
-//          - E.g. Pass parse_state to arena alloc functions
-//      - Restructure things like node_list, tokenised_json etc. to be tidier
-//      - Consistently pass pointers or by value
-//      - Get rid of this quote marks weirdness - Not easy to track subtractions and which functions should handle it automatically
-//      - Public-facing API
-//      - Persistent parse_state structure:
-//          - Memory arenas and sensible allocations
-//          - Pase base pointer to parsed_json for ease of deallocation
-//  - Handle earlier parsing stages failing
+//      - Reorder structs like node_list, tokenised_json etc. to be tidier
+//      - Get rid of quote marks weirdness with "-2" to string lengths when copying
 //  - Retrieve values
 //  - Editing
 //  - Control how much mem used for token array
 //  - Testing
 //  - Remove recursion in favour of linear functions with stack for control flow?
+//  - Strings are assumed UTF-8 - Anyone sending emoji over json is insane
 
 typedef uint8_t  u8;
 typedef uint32_t u32;
@@ -40,6 +34,14 @@ typedef int32_t  s32;
 typedef int64_t  s64;
 typedef float    f32;
 typedef double   f64;
+
+typedef void* (*alloc_func)(u64);
+typedef void* (*realloc_func)(void*,u64);
+typedef void  (*dealloc_func)(void*);
+
+alloc_func   alloc;
+realloc_func resize_alloc;
+dealloc_func dealloc;
 
 u8 is_letter(unsigned char c)
 {
@@ -399,7 +401,7 @@ void tokenise_json(json_parse_state *parse_state, const char *src, u32 src_size)
     //Initially the returned token array is alloc'd at 128 tokens
     u32 token_cap      = 128;
     u32 num_tokens     = 0;
-    json_token *tokens = (json_token*)malloc(token_cap * sizeof(json_token));
+    json_token *tokens = (json_token*)alloc(token_cap * sizeof(json_token));
     
     json_token *last_read = NULL;
     const char *src_current = src;
@@ -409,7 +411,7 @@ void tokenise_json(json_parse_state *parse_state, const char *src, u32 src_size)
         if(num_tokens >= token_cap)
         {
             token_cap *= 2;
-            tokens = (json_token*)realloc(tokens, token_cap * sizeof(json_token));
+            tokens = (json_token*)resize_alloc(tokens, token_cap * sizeof(json_token));
         }
         last_read    = &tokens[num_tokens];
         *last_read   = read_json_token(src_current, src, src_end);
@@ -721,7 +723,7 @@ u32 push_node_to_list(json_node_list *node_list, json_type node_type)
     if(num_nodes >= cap_nodes)
     {
         cap_nodes *= 2;
-        node_list->nodes = (json_node*)realloc(node_list->nodes, cap_nodes * sizeof(json_node));
+        node_list->nodes = (json_node*)resize_alloc(node_list->nodes, cap_nodes * sizeof(json_node));
         node_list->cap_nodes = cap_nodes;
     }
     u32 index = num_nodes;
@@ -834,7 +836,7 @@ void count_json_nodes(json_parse_state *parse_state)
     }
 
     u32 cap_nodes = 128;
-    json_node *nodes = (json_node*)malloc(cap_nodes * sizeof(json_node));
+    json_node *nodes = (json_node*)alloc(cap_nodes * sizeof(json_node));
     json_node_list node_list = {.num_nodes = 0, .cap_nodes = cap_nodes, .nodes = nodes};
 
     parse_state->node_list = node_list;
@@ -868,8 +870,8 @@ void count_json_mem_requirements(json_node_list *node_list, u32 *dst_num_values,
 
 typedef struct
 {
+    void *free_mem_base;
     json_object root;
-    u8 parse_status;
 } json_parsed;
 
 json_node *get_next_node(json_parse_state *parse_state)
@@ -989,9 +991,14 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
     count_json_mem_requirements(&parse_state->node_list, &total_num_values, &total_string_chars, &total_key_strings);
 
     // Allocate memory for json_values, key strings and value strings
-    json_value *json_values_buffer = (json_value*)malloc(total_num_values * sizeof(json_value));
-    char       *string_char_buffer = (char*)malloc(total_string_chars * sizeof(char));
-    json_string *key_strings_buffer = (json_string*)malloc(total_key_strings * sizeof(json_string));
+    u32 json_values_size  = total_num_values   * sizeof(json_value);
+    u32 string_chars_size = total_string_chars * sizeof(char);
+    u32 key_strings_size  = total_key_strings  * sizeof(json_string);
+
+    void *free_mem_base = alloc(json_values_size + string_chars_size + key_strings_size);
+    json_value *json_values_buffer  = free_mem_base;
+    char       *string_char_buffer  = free_mem_base + json_values_size;
+    json_string *key_strings_buffer = free_mem_base + json_values_size + string_chars_size;
 
     json_values_arena values_arena = {.num_allocd_values = 0, .total_num_values = total_num_values, .values = json_values_buffer};
     string_chars_arena chars_arena = {.num_allocd_chars = 0, .total_num_chars = total_string_chars, .chars = string_char_buffer};
@@ -1003,6 +1010,9 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
     parse_state->num_nodes_consumed = 0;
 
     populate_json_object(&parsed_json.root, parse_state);
+
+    if(parse_state->status == JSON_STATUS_PARSED) parsed_json.free_mem_base = free_mem_base;
+    else                                          dealloc(free_mem_base);
 
     return parsed_json;
 }
@@ -1021,11 +1031,15 @@ json_parsed parse_json(const char *src, u32 src_size)
 
     // Parse and divvy json_values memory
     json_parsed parsed_json = populate_parsed_json(&parse_state);
+
+    if(parse_state.node_list.nodes)  dealloc(parse_state.node_list.nodes);
+    if(parse_state.token_src.tokens) dealloc(parse_state.token_src.tokens);
+
     return parsed_json;
 }
 
-void print_json_object(json_object*,u32);
-void print_json_array(json_array*,u32);
+void print_json_object(json_object*,u32,u32);
+void print_json_array(json_array*,u32,u32);
 
 void print_json_string(json_string *string)
 {
@@ -1059,18 +1073,18 @@ void print_json_value(json_value *value, u32 indent)
         }
         case JSON_OBJECT:
         {
-            print_json_object(&value->object, indent+2);
+            print_json_object(&value->object, indent, indent+2);
             break;
         }
         case JSON_ARRAY:
         {
-            print_json_array(&value->array, indent+2);
+            print_json_array(&value->array, indent, indent+2);
             break;
         }
     }
 }
 
-void print_json_array(json_array *array, u32 indent)
+void print_json_array(json_array *array, u32 start_column, u32 indent)
 {
     printf("[");
     if(array->num_values > 0)
@@ -1083,12 +1097,12 @@ void print_json_array(json_array *array, u32 indent)
             if(i < array->num_values - 1) printf(",");
             printf("\n");
         }
-        for(u32 i = 0; i < indent; i += 1) printf("  ");
+        for(u32 i = 0; i < start_column; i += 1) printf("  ");
     }
     printf("]");
 }
 
-void print_json_object(json_object *object, u32 indent)
+void print_json_object(json_object *object, u32 start_column, u32 indent)
 {
     printf("{");
     if(object->num_pairs > 0)
@@ -1103,82 +1117,25 @@ void print_json_object(json_object *object, u32 indent)
             if(i < object->num_pairs - 1) printf(",");
             printf("\n");
         }
-        for(u32 i = 0; i < indent; i += 1) printf("  ");
+        for(u32 i = 0; i < start_column; i += 1) printf("  ");
     }
     printf("}");
 }
 
 void print_json_parsed(json_parsed *parsed_json)
 {    
-    print_json_object(&parsed_json->root, 0);
+    print_json_object(&parsed_json->root, 0, 2);
+    printf("\n");
 }
 
-const char test_json_0[] =
-"{\n"
-"\"Hello\":\"500\",\n"
-"\"Goodbye\":100,\n"
-"\"Weehee\":10.433,\n"
-"\"Obj\":{\"new\":\"ci\", \"old\":{\"a\":1, \"b\":2}},\n"
-"\"Arr\":[0, 1, [2, 3, 4], {\"Hi\": \"Bye\"}, \"2\", \"three\", 4.0, {\"Me\":5, \"You\": \"6.0\", \"Them\":[0, 1, \"2\"]}]\n"
-"}";
-
-const char test_json_1[] =
-"{\n"
-"\"Hello\":20,\n"
-"\"Goodbye\":10,\n"
-"\"Gay\":\"\",\n"
-"\"Arr\": []\n"
-"}";
-
-int main(int argc, char **argv)
+void set_allocation_functions(alloc_func given_alloc, realloc_func given_realloc, dealloc_func given_dealloc)
 {
-    const char *test_json = test_json_0;
-    u32 test_json_size = strlen(test_json);
+    alloc        = given_alloc;
+    resize_alloc = given_realloc;
+    dealloc      = given_dealloc;
+}
 
-    /*
-    json_parse_state parse_state;
-
-    printf("Tokenising...\n");
-    tokenise_json(&parse_state, test_json, test_json_size);
-    printf("Done tokenising\n");
-
-    json_tokenised tokenised_json = parse_state.token_src;
-    for(u32 i = 0; i < tokenised_json.num_tokens; i += 1)
-    {
-        print_json_token(&tokenised_json.tokens[i]);
-        printf(" ");
-    }
-    printf("\n\n");
-
-    validate_json(&parse_state);
-    if(!parse_state.status == JSON_STATUS_VALID)
-    {
-        printf("INVALID JSON WTH???\n");
-    }
-    else
-    {
-        printf("JSON HECKIN VALID!\n");
-    }
-
-    count_json_nodes(&parse_state);
-    json_node_list node_list = parse_state.node_list;
-    for(u32 i = 0; i < node_list.num_nodes; i += 1)
-    {
-        json_node *node = &node_list.nodes[i];
-        printf("Node %u: Type = %u Num vals = %u Num key strings = %u Num chars = %u\n", i, node->type, node->num_values, node->num_key_strings, node->num_string_chars);
-    }
-    printf("Parsing...\n");
-    json_parsed parsed_json = populate_parsed_json(&parse_state);
-    printf("Parsed!\n");
-    printf("Root object: num values = %u\n", parsed_json.root.num_pairs);
-    for(u32 i = 0; i < parsed_json.root.num_pairs; i += 1)
-    {
-        json_string key = parsed_json.root.keys[i];
-        json_value  val = parsed_json.root.values[i];
-        printf("\"%.*s\":Type(%u)\n", key.size, key.chars, val.type);
-    }
-    printf("\n\n");*/
-    json_parsed parsed_json = parse_json(test_json, test_json_size);
-    print_json_parsed(&parsed_json);
-    return 0;
+void dealloc_parsed_json(json_parsed parsed_json)
+{
+    dealloc(parsed_json.free_mem_base);
 }
