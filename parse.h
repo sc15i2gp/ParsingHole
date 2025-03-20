@@ -8,7 +8,7 @@
 //      - Reorder structs + funcs
 //      - Make good looking public-facing API at top of header
 //  - Print parsed json
-//      - Align value positions in objects (arrays already aligned)
+//      - Align value positions in objects? (arrays already aligned)
 //      - May need additional info for neatly aligning values
 //          - Namely what the largest key in an object is
 //  - Validation
@@ -24,6 +24,7 @@
 //  - Control how much mem used for token array
 //  - Testing
 //  - Remove recursion in favour of linear functions with stack for control flow?
+//  - Asserts?
 //  - Strings are assumed UTF-8 - Anyone sending emoji over json is insane
 
 typedef uint8_t  u8;
@@ -520,10 +521,11 @@ void print_offending_token(json_parse_state *parse_state, json_token *offending_
     }
 
     printf("Parse error at:\n");
+
     // Print offending token and surrounding characters, including ellipses where appropriate
     printf("%.*s\n", src_info_str_len, src_info_str);
 
-    // Print arrow underneath pointing to offending token
+    // Print arrow underneath, pointing to offending token
     for(u32 i = 0; i < src_info_str_token_loc; i += 1) printf(" ");
     printf("^");
     for(u32 i = 0; i < offending_token->length; i += 1) printf("~");
@@ -928,7 +930,6 @@ void populate_json_value(json_value *dst, json_parse_state *parse_state)
 
 void populate_json_array(json_array *dst, json_parse_state *parse_state)
 {
-    //TODO: Assert node is array node
     json_node *node = get_next_node(parse_state);
     u32 num_node_vals = node->num_values;
     u32 num_node_keys = node->num_key_strings;
@@ -948,7 +949,6 @@ void populate_json_array(json_array *dst, json_parse_state *parse_state)
 
 void populate_json_object(json_object *dst, json_parse_state *parse_state)
 {
-    //TODO: Assert node is object node
     json_node *node    = get_next_node(parse_state);
     u32 num_node_vals  = node->num_values;
     u32 num_node_keys  = node->num_key_strings;
@@ -994,8 +994,10 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
     u32 json_values_size  = total_num_values   * sizeof(json_value);
     u32 string_chars_size = total_string_chars * sizeof(char);
     u32 key_strings_size  = total_key_strings  * sizeof(json_string);
+    u32 free_mem_size     = json_values_size + string_chars_size + key_strings_size;
 
-    void *free_mem_base = alloc(json_values_size + string_chars_size + key_strings_size);
+    void *free_mem_base = alloc(free_mem_size);
+    memset(free_mem_base, 0, free_mem_size);
     json_value *json_values_buffer  = free_mem_base;
     char       *string_char_buffer  = free_mem_base + json_values_size;
     json_string *key_strings_buffer = free_mem_base + json_values_size + string_chars_size;
