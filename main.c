@@ -3,7 +3,7 @@
 const char test_json_0[] =
 "{\n"
 "\"Hello\":\"500\",\n"
-"\"Goodbye\":100,\n"
+"\"Goodbye\":null,\n"
 "\"Weehee\":10.433,\n"
 "\"Obj\":{\"new\":\"ci\", \"old\":{\"a\":1, \"b\":2}},\n"
 "\"Arr\":[0, 1, [2, 3, 4], {\"Hi\": \"Bye\"}, \"2\", \"three\", 4.0, {\"Me\":5, \"You\": \"6.0\", \"Them\":[0, 1, \"2\"]}]\n"

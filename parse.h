@@ -913,6 +913,12 @@ void populate_json_value(json_value *dst, json_parse_state *parse_state)
             token = next_token(parse_state);
             break;
         }
+        case TOKEN_NULL:
+        {
+            dst->type = JSON_NULL;
+            token = next_token(parse_state);
+            break;
+        }
         case TOKEN_OBRACE:
         {
             dst->type = JSON_OBJECT;
