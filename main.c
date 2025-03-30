@@ -22,8 +22,19 @@ int main(int argc, char **argv)
     const char *test_json = test_json_0;
     u32 test_json_size = strlen(test_json);
 
-        set_allocation_functions(&malloc, &realloc, &free);
-        json_parsed parsed_json = parse_json(test_json, test_json_size);
-        print_json_parsed(&parsed_json);
+    set_allocation_functions(&malloc, &realloc, &free);
+    json_parsed parsed_json = parse_json(test_json, test_json_size);
+    print_json_parsed(&parsed_json);
+
+    // Use case - Testing and traversing for values
+    // Use case - JSON structure known, no need for testing.
+    json_string key;
+    if(argc == 1) key = to_json_string("Hello");
+    else          key = to_json_string(argv[1]);
+
+    printf("Looking for \"%.*s\"...\n", key.size, key.chars);
+
+    //TODO
+
     return 0;
 }
