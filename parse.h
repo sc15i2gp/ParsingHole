@@ -7,7 +7,13 @@
 #include <string.h>
 
 // JSON PARSING:
-//  - Use indices instead of pointers in json ooas
+//  - Make it so if there's a realloc then indices don't need to be updated
+//      - Parsed json consists of values and keys arrays
+//      - Parsed json ooas are lists of values and strings stored in the values array as references to value ranges
+//      - I don't want these references to need updating should the parsed json be edited
+//      - Change parsed json structure to be keys_arena, values_arena, chars arena, ooas list, mem base
+//  - Tidy the whole index thing
+//      - Consistently use json_val_ptr and such
 //  - json does-not-exist value
 //  - Retrieve values
 //      - Better function naming
@@ -111,11 +117,14 @@ u8 json_string_eq(json_string s0, json_string s1)
 typedef struct json_ooa   json_ooa;
 typedef struct json_value json_value;
 
+typedef u32 json_val_ptr;
+typedef u32 json_str_ptr;
+
 struct json_ooa
 {
     u32          size;
-    json_value  *values;
-    json_string *keys;
+    json_val_ptr values;
+    json_str_ptr keys;
 };
 
 struct json_value
@@ -137,9 +146,9 @@ typedef struct
     json_value *values;
 } json_values_arena;
 
-json_value *alloc_json_values(json_values_arena *arena, u32 num_to_alloc)
+u32 alloc_json_values(json_values_arena *arena, u32 num_to_alloc)
 {
-    json_value *allocation = arena->values + arena->num_allocd_values;
+    u32 allocation = arena->num_allocd_values;
     arena->num_allocd_values += num_to_alloc;
     return allocation;
 }
@@ -165,9 +174,9 @@ typedef struct
     json_string *keys;
 } key_strings_arena;
 
-json_string *alloc_key_strings(key_strings_arena *arena, u32 num_to_alloc)
+u32 alloc_key_strings(key_strings_arena *arena, u32 num_to_alloc)
 {
-    json_string *allocation = arena->keys + arena->num_allocd_keys;
+    u32 allocation = arena->num_allocd_keys;
     arena->num_allocd_keys += num_to_alloc;
     return allocation;
 }
@@ -895,11 +904,12 @@ json_ooa_count *get_next_ooa(json_parse_state *parse_state)
 
 // ============================== Populate parsed JSON ===================================
 
-void populate_json_object(json_ooa*, json_parse_state*);
-void populate_json_array(json_ooa*, json_parse_state*);
+void populate_json_object(u32,json_string*,json_value*,json_parse_state*);
+void populate_json_array(u32,json_string*,json_value*,json_parse_state*);
 
-void populate_json_value(json_value *dst, json_parse_state *parse_state)
+void populate_json_value(u32 dst_index, json_string *keys, json_value *values, json_parse_state *parse_state)
 {
+    json_value *dst = &values[dst_index];
     json_token *token = lookahead_token(parse_state); // Value
     switch(token->type)
     {
@@ -934,48 +944,55 @@ void populate_json_value(json_value *dst, json_parse_state *parse_state)
         case TOKEN_OBRACE:
         {
             dst->type = JSON_OBJECT;
-            populate_json_object(&dst->ooa, parse_state);
+            populate_json_object(dst_index, keys, values, parse_state);
             break;
         }
         case TOKEN_OBRACK:
         {
             dst->type = JSON_ARRAY;
-            populate_json_array(&dst->ooa, parse_state);
+            populate_json_array(dst_index, keys, values, parse_state);
             break;
         }
     }
 }
 
-void populate_json_array(json_ooa *dst, json_parse_state *parse_state)
+void populate_json_array(u32 dst_index, json_string *keys, json_value *values, json_parse_state *parse_state)
 {
-    json_ooa_count *ooa    = get_next_ooa(parse_state);
+    json_ooa *dst = &values[dst_index].ooa;
+    json_ooa_count *ooa = get_next_ooa(parse_state);
     u32 num_ooa_vals = ooa->num_values;
     u32 num_ooa_keys = ooa->num_key_strings;
 
-    json_value *ooa_vals = alloc_json_values(&parse_state->values_arena, num_ooa_vals);
-    dst->values          = ooa_vals;
-    dst->size            = num_ooa_vals;
+    u32 ooa_vals_index   = alloc_json_values(&parse_state->values_arena, num_ooa_vals);
+    json_value *ooa_vals = &values[ooa_vals_index];
+
+    dst->values = ooa_vals_index;
+    dst->size   = num_ooa_vals;
 
     json_token *token = next_token(parse_state); // Obrack 
     if(num_ooa_vals == 0) token = next_token(parse_state); // Skip array if empty
     else for(u32 i = 0; i < num_ooa_vals; i += 1)
     {
-        populate_json_value(&dst->values[i], parse_state);
+        populate_json_value(ooa_vals_index+i, keys, values, parse_state);
         token = next_token(parse_state); // Comma or Cbrack
     }
 }
 
-void populate_json_object(json_ooa *dst, json_parse_state *parse_state)
+void populate_json_object(u32 dst_index, json_string *keys, json_value *values, json_parse_state *parse_state)
 {
+    json_ooa *dst = &values[dst_index].ooa;
     json_ooa_count *ooa    = get_next_ooa(parse_state);
     u32 num_ooa_vals = ooa->num_values;
     u32 num_ooa_keys = ooa->num_key_strings;
 
-    json_value *ooa_vals  = alloc_json_values(&parse_state->values_arena, num_ooa_vals);
-    json_string *ooa_keys = alloc_key_strings(&parse_state->keys_arena, num_ooa_keys);
+    u32 ooa_vals_index = alloc_json_values(&parse_state->values_arena, num_ooa_vals);
+    u32 ooa_keys_index = alloc_key_strings(&parse_state->keys_arena, num_ooa_keys);
 
-    dst->keys   = ooa_keys;
-    dst->values = ooa_vals;
+    json_value  *ooa_vals = &values[ooa_vals_index];
+    json_string *ooa_keys = &keys[ooa_keys_index];
+
+    dst->keys   = ooa_keys_index;
+    dst->values = ooa_vals_index;
     dst->size   = num_ooa_vals;
 
     json_token *token = next_token(parse_state); // Obrace
@@ -984,9 +1001,9 @@ void populate_json_object(json_ooa *dst, json_parse_state *parse_state)
     {
         token = next_token(parse_state); // Key string
         char *key_string_chars = alloc_string_chars_no_quotes(&parse_state->chars_arena, token->length);
-        dst->keys[i] = copy_to_json_string_no_quotes(token, key_string_chars);
+        ooa_keys[i] = copy_to_json_string_no_quotes(token, key_string_chars);
         token = next_token(parse_state); // Colon
-        populate_json_value(&dst->values[i], parse_state);
+        populate_json_value(ooa_vals_index+i, keys, values, parse_state);
         token = next_token(parse_state); // Comma or cbrace
     }
 }
@@ -994,7 +1011,9 @@ void populate_json_object(json_ooa *dst, json_parse_state *parse_state)
 typedef struct
 {
     void *free_mem_base;
-    json_ooa root;
+    json_string *keys;
+    json_value  *values;
+    //json_ooa root;
 } json_parsed;
 
 json_parsed populate_parsed_json(json_parse_state *parse_state)
@@ -1011,6 +1030,7 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
     u32 total_key_strings;
     count_json_mem_requirements(&parse_state->ooa_list, &total_num_values, &total_string_chars, &total_key_strings);
 
+    total_num_values += 1;
     // Allocate memory for json_values, key strings and value strings
     u32 json_values_size  = total_num_values   * sizeof(json_value);
     u32 string_chars_size = total_string_chars * sizeof(char);
@@ -1032,7 +1052,11 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
     parse_state->num_tokens_parsed = 0;
     parse_state->num_ooas_consumed = 0;
 
-    populate_json_object(&parsed_json.root, parse_state);
+    alloc_json_values(&parse_state->values_arena, 1);
+    populate_json_object(0, key_strings_buffer, json_values_buffer, parse_state);
+    //parsed_json.root = json_values_buffer[0].ooa;
+    parsed_json.values = json_values_buffer;
+    parsed_json.keys   = key_strings_buffer;
 
     if(parse_state->status == JSON_STATUS_PARSED) parsed_json.free_mem_base = free_mem_base;
     else                                          dealloc(free_mem_base);
@@ -1061,16 +1085,17 @@ json_parsed parse_json(const char *src, u32 src_size)
     return parsed_json;
 }
 
-void print_json_object(json_ooa*,u32,u32);
-void print_json_array(json_ooa*,u32,u32);
+void print_json_object(u32,json_string*,json_value*,u32,u32);
+void print_json_array(u32,json_string*,json_value*,u32,u32);
 
 void print_json_string(json_string *string)
 {
     printf("\"%.*s\"", string->size, string->chars);
 }
 
-void print_json_value(json_value *value, u32 indent)
+void print_json_value(u32 value_index, json_string *keys_array, json_value *values_array, u32 indent)
 {
+    json_value *value = &values_array[value_index];
     switch(value->type)
     {
         case JSON_NUMBER:
@@ -1096,19 +1121,20 @@ void print_json_value(json_value *value, u32 indent)
         }
         case JSON_OBJECT:
         {
-            print_json_object(&value->ooa, indent, indent+2);
+            print_json_object(value_index, keys_array, values_array, indent, indent+2);
             break;
         }
         case JSON_ARRAY:
         {
-            print_json_array(&value->ooa, indent, indent+2);
+            print_json_array(value_index, keys_array, values_array, indent, indent+2);
             break;
         }
     }
 }
 
-void print_json_array(json_ooa *array, u32 start_column, u32 indent)
+void print_json_array(u32 array_index, json_string *keys_array, json_value *values_array, u32 start_column, u32 indent)
 {
+    json_ooa *array = &values_array[array_index].ooa;
     printf("[");
     if(array->size > 0)
     {
@@ -1116,7 +1142,7 @@ void print_json_array(json_ooa *array, u32 start_column, u32 indent)
         for(u32 i = 0; i < array->size; i += 1)
         {
             for(u32 j = 0; j < indent; j += 1) printf("  ");
-            print_json_value(&array->values[i], indent);
+            print_json_value(array->values+i, keys_array, values_array, indent);
             if(i < array->size - 1) printf(",");
             printf("\n");
         }
@@ -1125,8 +1151,11 @@ void print_json_array(json_ooa *array, u32 start_column, u32 indent)
     printf("]");
 }
 
-void print_json_object(json_ooa *object, u32 start_column, u32 indent)
+void print_json_object(u32 object_index, json_string *keys_array, json_value *values_array, u32 start_column, u32 indent)
 {
+    json_ooa *object    = &values_array[object_index].ooa;
+    json_string *keys   = &keys_array[object->keys];
+    json_value  *values = &values_array[object->values];
     printf("{");
     if(object->size > 0)
     {
@@ -1134,9 +1163,9 @@ void print_json_object(json_ooa *object, u32 start_column, u32 indent)
         for(u32 i = 0; i < object->size; i += 1)
         {
             for(u32 j = 0; j < indent; j += 1) printf("  ");
-            print_json_string(&object->keys[i]);
+            print_json_string(&keys[i]);
             printf(":");
-            print_json_value(&object->values[i], indent);
+            print_json_value(object->values+i, keys_array, values_array, indent);
             if(i < object->size - 1) printf(",");
             printf("\n");
         }
@@ -1147,7 +1176,7 @@ void print_json_object(json_ooa *object, u32 start_column, u32 indent)
 
 void print_json_parsed(json_parsed *parsed_json)
 {    
-    print_json_object(&parsed_json->root, 0, 2);
+    print_json_object(0, parsed_json->keys, parsed_json->values, 0, 2);
     printf("\n");
 }
 
