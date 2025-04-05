@@ -7,8 +7,6 @@
 #include <string.h>
 
 // JSON PARSING:
-//  - json doesn't exist value
-//  - json_string hashes
 //  - Add get_ functions for json_parsed e.g. get_key_ptr(parsed_json, index)
 //  - ooas can be differentiated by whether they have keys - they don't need types
 //  - Retrieve values
@@ -83,6 +81,7 @@ void set_allocation_functions(alloc_func given_alloc, realloc_func given_realloc
 typedef enum
 {
     JSON_NONE,
+    JSON_DOESNT_EXIST,
     JSON_NUMBER,
     JSON_BOOL,
     JSON_NULL,
@@ -93,9 +92,21 @@ typedef enum
 
 typedef struct
 {
+    u32   hash;
     u32   size;
     char *chars;
 } json_string;
+
+void compute_json_string_hash(json_string *str)
+{
+    u32 hash = 5381;
+    for(u32 i = 0; i < str->size; i += 1)
+    {
+        s32 c = (s32)str->chars[i];
+        hash = ((hash << 5) + hash) + c;
+    }
+    str->hash = hash;
+}
 
 void print_json_string(json_string s)
 {
@@ -104,7 +115,7 @@ void print_json_string(json_string s)
 
 u8 json_string_eq(json_string s0, json_string s1)
 {
-    if(s0.size != s1.size) return 0;
+    if(s0.size != s1.size || s0.hash != s1.hash) return 0;
 
     for(u32 i = 0; i < s0.size; i += 1)
     {
@@ -277,6 +288,7 @@ json_string copy_to_json_string_no_quotes(json_token *token, char *string_buffer
     {
         string.chars[i-1] = token->loc[i];
     }
+    compute_json_string_hash(&string);
     return string;
 }
 
@@ -979,7 +991,7 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
     else
     {
         u32 num_keys   = 0; 
-        u32 num_values = 0;
+        u32 num_values = 1;
         for(u32 i = 0; i < parse_state->ooa_list.size; i += 1)
         {
             json_ooa *ooa = &parse_state->ooa_list.ooas[i];
@@ -1001,6 +1013,10 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
         json_mem_arena keys_arena   = {.cap = keys_buffer_size,   .allocd = 0, .allocs = 0, .buffer = keys_buffer};
         json_mem_arena values_arena = {.cap = values_buffer_size, .allocd = 0, .allocs = 0, .buffer = values_buffer};
         json_mem_arena chars_arena  = {.cap = chars_buffer_size,  .allocd = 0, .allocs = 0, .buffer = chars_buffer};
+
+        json_val_ptr none_value_index = alloc_json_values(&values_arena, 1);
+        json_value *val = get_arena_nth_alloc((&values_arena), none_value_index, json_value);
+        val->type = JSON_DOESNT_EXIST;
 
         parse_state->num_tokens_parsed = 0;
         parse_state->num_ooas_parsed   = 0;
@@ -1110,7 +1126,6 @@ void print_json_object(u32 object_index, json_parsed *parsed_json, u32 start_col
 
 void print_json_parsed(json_parsed *parsed_json)
 {
-    // TODO
     printf("PARSED\n");
     print_json_object(0, parsed_json, 0, 2);
     printf("\n");
