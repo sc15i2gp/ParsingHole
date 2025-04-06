@@ -6,10 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+// NOTE: I think I'm done with this. JSON sucks.
+
 // JSON PARSING:
-//  - Add get_ functions for json_parsed e.g. get_key_ptr(parsed_json, index)
-//  - ooas can be differentiated by whether they have keys - they don't need types
-//  - Retrieve values
 //  - Editing
 //  - Validation
 //      - Escape characters, backslashes, no control chars in strings
@@ -17,10 +16,20 @@
 //      - Have tildes in error arrow cover the offending token
 //      - No duplicate keys
 //  - Tidy
+//      - Handling src_end in loops in read_json_token
+//      - Handle null, true and false as special cases of JSON_WORD
 //      - Reorder stuff
 //          - Bare API at the top, otherwise structs near code that uses them.
 //      - Make sure code looks good
-//  - Control how much mem used for token array
+//      - ooas can be differentiated by whether they have keys - they don't need types
+//      - Using just u32 for ooas and values is getting somewhat confusing - Add type aliases
+//      - Control how much mem used for token array
+//      - Use only TOKEN_WORD to handle null and bool in tokens instead of having TOKEN_NULL and TOKEN_BOOL
+//      - Make having 0 as a non-value index (i.e. NULL) tidier
+//          - e.g. right now I have to set ooa_list_size and ooas_parsed to 1 in 2 different functions
+//          - so that counting and parsing don't overwrite the empty value at 0 index
+//      - Move any error reporting (i.e. printfs) to some "error handling" code
+//          - May make it easier to adapt this parsing code to another codebase which doesn't want it to printf
 //  - Testing
 //  - Performance
 //  - Remove recursion in favour of linear functions with stack for control flow?
@@ -61,6 +70,14 @@ u8 is_number_char(unsigned char c)
     return is_digit(c) || c == '-' || c == '+' || c == '.' || c == 'E' || c == 'e';
 }
 
+u8 is_symbol_with_meaning(unsigned char c)
+{
+    return c == ',' || c == ':' ||
+           c == '[' || c == ']' ||
+           c == '{' || c == '}' ||
+           c == '"' || c == '.';
+}
+
 // ============================== Parsing ===================================
 
 typedef void* (*alloc_func)(u64);
@@ -90,6 +107,18 @@ typedef enum
     JSON_ARRAY,
 } json_type;
 
+const char *json_type_names[] =
+{
+    "NONE",
+    "DOESN'T EXIST",
+    "NUMBER",
+    "BOOL",
+    "NULL",
+    "STRING",
+    "OBJECT",
+    "ARRAY",
+};
+
 typedef struct
 {
     u32   hash;
@@ -97,16 +126,23 @@ typedef struct
     char *chars;
 } json_string;
 
-void compute_json_string_hash(json_string *str)
+u32 compute_string_hash(const char *cstr, u32 size)
 {
     u32 hash = 5381;
-    for(u32 i = 0; i < str->size; i += 1)
+    for(u32 i = 0; i < size; i += 1)
     {
-        s32 c = (s32)str->chars[i];
+        s32 c = (s32)cstr[i];
         hash = ((hash << 5) + hash) + c;
     }
-    str->hash = hash;
+    return hash;
 }
+
+void compute_json_string_hash(json_string *str)
+{
+    str->hash = compute_string_hash(str->chars, str->size);
+}
+
+#define to_json_string(s) (json_string){.size = strlen(s), .chars = (char*)s, .hash = compute_string_hash(s, strlen(s))}
 
 void print_json_string(json_string s)
 {
@@ -124,15 +160,15 @@ u8 json_string_eq(json_string s0, json_string s1)
     return 1;
 }
 
-#define to_json_string(s) (json_string){strlen(s), (char*)s}
-
 typedef enum
 {
     TOKEN_NONE,
     TOKEN_STRING,
+    TOKEN_WORD,         // String without quote marks, not allowed in most cases
     TOKEN_NUMBER,
     TOKEN_BOOL,
     TOKEN_NULL,
+    TOKEN_STOP   = '.',
     TOKEN_COMMA  = ',',
     TOKEN_COLON  = ':',
     TOKEN_OBRACK = '[',
@@ -159,6 +195,7 @@ typedef struct
 typedef struct
 {
     u32         num_tokens;
+    u32         token_index;
     json_token *tokens;
     u32         src_size;
     const char *src;
@@ -220,7 +257,6 @@ u32 alloc_arena_mem(json_mem_arena *arena, u32 alloc_size, u32 num_allocs)
 typedef struct
 {
     json_parse_status status;
-    u32               num_tokens_parsed;
     json_tokenised    token_src;
     u32               num_chars_counted;
     u32               num_ooas_parsed;
@@ -235,12 +271,33 @@ typedef struct
     json_type type;
     union
     {
+        void        *base;
         f64          number;
         u8           boolean;
         json_string  string;
         json_ooa_ptr ooa;
     };
 } json_value;
+
+void print_json_value_type_string(json_value *val)
+{
+    printf("%s", json_type_names[val->type]);
+}
+
+void print_json_value_contents(json_value *val)
+{
+    switch(val->type)
+    {
+        case JSON_NONE:         printf("???");                  break;
+        case JSON_DOESNT_EXIST: printf("DOESN'T EXIST");        break;
+        case JSON_NUMBER:       printf("%f", val->number);      break;
+        case JSON_BOOL:         printf("%u", val->boolean);     break;
+        case JSON_NULL:         printf("null");                 break;
+        case JSON_STRING:       print_json_string(val->string); break;
+        case JSON_OBJECT:
+        case JSON_ARRAY:        printf("Index %u", val->ooa);   break;
+    }
+}
 
 json_ooa *push_ooa_to_list(json_ooa_list *ooa_list, json_type type)
 {
@@ -268,15 +325,18 @@ void print_token_type(json_token_type t)
     switch(t)
     {
         case TOKEN_STRING: printf("TOKEN_STRING"); break;
+        case TOKEN_WORD:   printf("TOKEN_WORD");   break;
         case TOKEN_NUMBER: printf("TOKEN_NUMBER"); break;
         case TOKEN_BOOL:   printf("TOKEN_BOOL");   break;
         case TOKEN_NULL:   printf("TOKEN_NULL");   break;
+        case TOKEN_STOP:   printf("TOKEN_STOP");   break;
         case TOKEN_COMMA:  printf("TOKEN_COMMA");  break;
         case TOKEN_COLON:  printf("TOKEN_COLON");  break;
         case TOKEN_OBRACK: printf("TOKEN_OBRACK"); break;
         case TOKEN_CBRACK: printf("TOKEN_CBRACK"); break;
         case TOKEN_OBRACE: printf("TOKEN_OBRACE"); break;
         case TOKEN_CBRACE: printf("TOKEN_CBRACE"); break;
+        case TOKEN_END:    printf("TOKEN_END");    break;
         default:           printf("TOKEN_UNKNOWN");break;
     }
 }
@@ -292,6 +352,13 @@ json_string copy_to_json_string_no_quotes(json_token *token, char *string_buffer
     return string;
 }
 
+json_string token_to_json_string_no_copy(json_token *token)
+{
+    json_string string = {.size = token->length, .chars = token->loc};
+    compute_json_string_hash(&string);
+    return string;
+}
+
 void print_json_token_info(json_token *t)
 {
     printf("Token: Type("); print_token_type(t->type); printf(") ");
@@ -303,6 +370,7 @@ void print_json_token(json_token *t)
     switch(t->type)
     {
         case TOKEN_STRING:
+        case TOKEN_WORD:
         {
             printf("%.*s", t->length, t->loc);
             break;
@@ -365,6 +433,7 @@ json_token read_json_token(const char *src, const char *src_start, const char *s
         case ']':
         case '{':
         case '}':
+        case '.':
         {
             token.type   = *src;
             token.length = 1;
@@ -375,7 +444,7 @@ json_token read_json_token(const char *src, const char *src_start, const char *s
             // String token includes the surrounding quote marks
             token.type = TOKEN_STRING;
             const char *c = src + 1;
-            for(; *c != '"'; c += 1);
+            for(; c < src_end && *c != '"'; c += 1);
             token.length = (c - src) + 1;
             break;
         }
@@ -416,9 +485,16 @@ json_token read_json_token(const char *src, const char *src_start, const char *s
             {
                 token.type = TOKEN_NUMBER;
                 const char *c = src + 1;
-                for(; is_number_char(*c); c += 1);
+                for(; c < src_end && is_number_char(*c); c += 1);
                 token.length = c - src;
                 token.numeric_value = atof(src);
+            }
+            else if(!is_symbol_with_meaning(*src))
+            {
+                token.type = TOKEN_WORD;
+                const char *c = src + 1;
+                for(; c < src_end && !is_symbol_with_meaning(*c); c += 1);
+                token.length = c - src;
             }
         }
     }
@@ -426,7 +502,7 @@ json_token read_json_token(const char *src, const char *src_start, const char *s
     return token;
 }
 
-void tokenise_json(json_parse_state *parse_state, const char *src, u32 src_size)
+json_tokenised tokenise_json(const char *src, u32 src_size)
 {
     //Initially the returned token array is alloc'd at 128 tokens
     u32 token_cap      = 128;
@@ -452,38 +528,46 @@ void tokenise_json(json_parse_state *parse_state, const char *src, u32 src_size)
 
     json_tokenised tokenised_json =
     {
-        .num_tokens = num_tokens,
-        .tokens     = tokens,
-        .src        = src,
-        .src_size   = src_size
+        .num_tokens  = num_tokens,
+        .token_index = 0,
+        .tokens      = tokens,
+        .src         = src,
+        .src_size    = src_size
     };
-    parse_state->token_src = tokenised_json;
+    return tokenised_json;
+}
+
+void reset_tokenised_json(json_tokenised *tokenised_json)
+{
+    tokenised_json->token_index = 0;
+}
+
+void tokenise_json_in_parse_state(json_parse_state *parse_state, const char *src, u32 src_size)
+{
+    parse_state->token_src = tokenise_json(src, src_size);
     parse_state->status    = JSON_STATUS_TOKENISED;
 }
 
 // Gets last consumed token
-json_token *current_token(json_parse_state *parse_state)
+json_token *current_token(json_tokenised *token_src)
 {
     // Assume no one is calling at the start of a token array
-    u32 token_index = parse_state->num_tokens_parsed - 1;
-    json_token *token = &parse_state->token_src.tokens[token_index];
+    u32 token_index = token_src->token_index - 1;
+    json_token *token = &token_src->tokens[token_index];
     return token;
 }
 
-json_token *next_token(json_parse_state *parse_state)
+json_token *next_token(json_tokenised *token_src)
 {
-    u32 token_index = parse_state->num_tokens_parsed;
-    json_token *token = &parse_state->token_src.tokens[token_index];
-    token_index += 1;
-    parse_state->num_tokens_parsed = token_index;
+    json_token *token = &token_src->tokens[token_src->token_index];
+    token_src->token_index += 1;
     return token;
 }
 
 // Same as next_token but without considering next token parsed
-json_token *lookahead_token(json_parse_state *parse_state)
+json_token *lookahead_token(json_tokenised *token_src)
 {
-    u32 token_index = parse_state->num_tokens_parsed;
-    json_token *token = &parse_state->token_src.tokens[token_index];
+    json_token *token = &token_src->tokens[token_src->token_index];
     return token;
 }
 
@@ -592,7 +676,7 @@ u8 validate_json_array(json_parse_state*);
 
 u8 validate_json_value(json_parse_state *parse_state)
 {
-    json_token *lh = lookahead_token(parse_state);
+    json_token *lh = lookahead_token(&parse_state->token_src);
     if(lh->type == TOKEN_OBRACE)
     {
         u8 is_value_valid = validate_json_object(parse_state);
@@ -605,7 +689,7 @@ u8 validate_json_value(json_parse_state *parse_state)
     }
     else
     {
-        json_token *token = next_token(parse_state);
+        json_token *token = next_token(&parse_state->token_src);
         switch(token->type)
         {
             case TOKEN_STRING:
@@ -627,7 +711,7 @@ u8 validate_json_value(json_parse_state *parse_state)
 u8 validate_json_pair(json_parse_state *parse_state)
 {
     // Key string
-    json_token *token = next_token(parse_state);
+    json_token *token = next_token(&parse_state->token_src);
     if(token->type != TOKEN_STRING)
     {
         json_validation_error(parse_state, token, TOKEN_STRING);
@@ -640,7 +724,7 @@ u8 validate_json_pair(json_parse_state *parse_state)
     }
 
     // Colon
-    token = next_token(parse_state);
+    token = next_token(&parse_state->token_src);
     if(token->type != TOKEN_COLON)
     {
         json_validation_error(parse_state, token, TOKEN_COLON);
@@ -655,25 +739,25 @@ u8 validate_json_pair(json_parse_state *parse_state)
 
 u8 validate_json_array(json_parse_state *parse_state)
 {
-    json_token *token = next_token(parse_state);
+    json_token *token = next_token(&parse_state->token_src);
     if(token->type != TOKEN_OBRACK)
     {
         json_validation_error(parse_state, token, TOKEN_OBRACK);
         return 0;
     }
 
-    json_token *lh = lookahead_token(parse_state);
+    json_token *lh = lookahead_token(&parse_state->token_src);
     while(lh->type != TOKEN_CBRACK)
     {
         u8 value_valid = validate_json_value(parse_state);
         if(!value_valid) return 0;
 
-        token = current_token(parse_state);
-        lh    = lookahead_token(parse_state);
+        token = current_token(&parse_state->token_src);
+        lh    = lookahead_token(&parse_state->token_src);
         if(lh->type == TOKEN_COMMA)
         {
-            token = next_token(parse_state);
-            lh    = lookahead_token(parse_state);
+            token = next_token(&parse_state->token_src);
+            lh    = lookahead_token(&parse_state->token_src);
         }
         else if(lh->type != TOKEN_CBRACK)
         {
@@ -687,32 +771,32 @@ u8 validate_json_array(json_parse_state *parse_state)
         json_validation_error(parse_state, lh, TOKEN_NUMBER, TOKEN_STRING, TOKEN_BOOL, TOKEN_NULL);
         return 0;
     }
-    token = next_token(parse_state); // Consume CBRACK token
+    token = next_token(&parse_state->token_src); // Consume CBRACK token
     return 1;
 }
 
 // Object is obrace, 0 or more key-value pairs followed by commas then cbrace
 u8 validate_json_object(json_parse_state *parse_state)
 {
-    json_token *token = next_token(parse_state);
+    json_token *token = next_token(&parse_state->token_src);
     if(token->type != TOKEN_OBRACE)
     {
         json_validation_error(parse_state, token, TOKEN_OBRACE);
         return 0;
     }
 
-    json_token *lh = lookahead_token(parse_state);
+    json_token *lh = lookahead_token(&parse_state->token_src);
     while(lh->type != TOKEN_CBRACE)
     {
         u8 pair_valid = validate_json_pair(parse_state);
         if(!pair_valid) return 0;
 
-        token = current_token(parse_state);
-        lh    = lookahead_token(parse_state);
+        token = current_token(&parse_state->token_src);
+        lh    = lookahead_token(&parse_state->token_src);
         if(lh->type == TOKEN_COMMA)
         {
-            token = next_token(parse_state);
-            lh    = lookahead_token(parse_state);
+            token = next_token(&parse_state->token_src);
+            lh    = lookahead_token(&parse_state->token_src);
         }
         else if(lh->type != TOKEN_CBRACE)
         {
@@ -726,7 +810,7 @@ u8 validate_json_object(json_parse_state *parse_state)
         json_validation_error(parse_state, lh, TOKEN_NUMBER, TOKEN_STRING, TOKEN_BOOL, TOKEN_NULL);
         return 0;
     }
-    token = next_token(parse_state); // Consume CBRACE token
+    token = next_token(&parse_state->token_src); // Consume CBRACE token
     return 1;
 }
 
@@ -738,7 +822,7 @@ void validate_json(json_parse_state *parse_state)
         return;
     }
 
-    parse_state->num_tokens_parsed = 0;
+    reset_tokenised_json(&parse_state->token_src);
     u8 json_validated = validate_json_object(parse_state);
     if(json_validated) parse_state->status = JSON_STATUS_VALID;
     else               parse_state->status = JSON_STATUS_INVALID;
@@ -755,31 +839,31 @@ void count_json_array(json_parse_state *parse_state)
     u32 num_chars   = 0;
 
     json_ooa   *dst   = push_ooa_to_list(&parse_state->ooa_list, JSON_ARRAY);
-    json_token *token = next_token(parse_state);
-    json_token *lh    = lookahead_token(parse_state);
+    json_token *token = next_token(&parse_state->token_src);
+    json_token *lh    = lookahead_token(&parse_state->token_src);
     while(lh->type != TOKEN_CBRACK)
     {
         num_values += 1;
-        lh = lookahead_token(parse_state);
+        lh = lookahead_token(&parse_state->token_src);
         if(lh->type == TOKEN_OBRACE) count_json_object(parse_state);
         else
         if(lh->type == TOKEN_OBRACK) count_json_array(parse_state);
         else
         {
-            token = next_token(parse_state);
+            token = next_token(&parse_state->token_src);
             if(token->type == TOKEN_STRING)
             {
                 num_chars   += token->length - 2; // Exclude quote marks
             }
         }
-        lh = lookahead_token(parse_state);
+        lh = lookahead_token(&parse_state->token_src);
         if(lh->type == TOKEN_COMMA)
         {
-            token = next_token(parse_state);
-            lh    = lookahead_token(parse_state);
+            token = next_token(&parse_state->token_src);
+            lh    = lookahead_token(&parse_state->token_src);
         }
     }
-    token = next_token(parse_state); // Consume cbrack
+    token = next_token(&parse_state->token_src); // Consume cbrack
 
     dst->size = num_values;
     parse_state->num_chars_counted += num_chars;
@@ -791,35 +875,35 @@ void count_json_object(json_parse_state *parse_state)
     u32 num_chars   = 0;
 
     json_ooa   *dst   = push_ooa_to_list(&parse_state->ooa_list, JSON_OBJECT);
-    json_token *token = next_token(parse_state); // Obrace
-    json_token *lh    = lookahead_token(parse_state);
+    json_token *token = next_token(&parse_state->token_src); // Obrace
+    json_token *lh    = lookahead_token(&parse_state->token_src);
     while(lh->type != TOKEN_CBRACE)
     {
-        token        = next_token(parse_state); // Key string
+        token        = next_token(&parse_state->token_src); // Key string
         num_values  += 1;
         num_chars   += token->length - 2; // Exclude quote marks around strings
         
-        token = next_token(parse_state); // Colon
-        lh    = lookahead_token(parse_state);
+        token = next_token(&parse_state->token_src); // Colon
+        lh    = lookahead_token(&parse_state->token_src);
         if(lh->type == TOKEN_OBRACE) count_json_object(parse_state);
         else
         if(lh->type == TOKEN_OBRACK) count_json_array(parse_state);
         else
         {
-            token = next_token(parse_state);
+            token = next_token(&parse_state->token_src);
             if(token->type == TOKEN_STRING)
             {
                 num_chars   += token->length - 2; // Exclude quote marks
             }
         }
-        lh = lookahead_token(parse_state);
+        lh = lookahead_token(&parse_state->token_src);
         if(lh->type == TOKEN_COMMA)
         {
-            token = next_token(parse_state);
-            lh    = lookahead_token(parse_state);
+            token = next_token(&parse_state->token_src);
+            lh    = lookahead_token(&parse_state->token_src);
         }
     }
-    token = next_token(parse_state); // Consume cbrace
+    token = next_token(&parse_state->token_src); // Consume cbrace
 
     dst->size = num_values;
     parse_state->num_chars_counted += num_chars;
@@ -834,10 +918,10 @@ void count_json_ooas_values_and_strings(json_parse_state *parse_state)
     }
 
     u32 cap                        = 128;
-    parse_state->num_tokens_parsed = 0;
     parse_state->ooa_list.cap      = cap;
-    parse_state->ooa_list.size     = 0;
+    parse_state->ooa_list.size     = 1;
     parse_state->ooa_list.ooas     = (json_ooa*)alloc(cap * sizeof(json_ooa));
+    reset_tokenised_json(&parse_state->token_src);
     count_json_object(parse_state);
 
     parse_state->status = JSON_STATUS_COUNTED;
@@ -857,21 +941,21 @@ json_ooa_ptr populate_json_array(json_parse_state*);
 
 void populate_json_value(json_value *dst, json_parse_state *parse_state)
 {
-    json_token *token = lookahead_token(parse_state);
+    json_token *token = lookahead_token(&parse_state->token_src);
     switch(token->type)
     {
         case TOKEN_NUMBER:
         {
             dst->type   = JSON_NUMBER;
             dst->number = token->numeric_value;
-            token       = next_token(parse_state);
+            token       = next_token(&parse_state->token_src);
             break;
         }
         case TOKEN_BOOL:
         {
             dst->type    = JSON_BOOL;
             dst->boolean = token->boolean_value;
-            token        = next_token(parse_state);
+            token        = next_token(&parse_state->token_src);
             break;
         }
         case TOKEN_STRING:
@@ -879,13 +963,13 @@ void populate_json_value(json_value *dst, json_parse_state *parse_state)
             dst->type   = JSON_STRING;
             char *cstr  = alloc_json_chars((&parse_state->chars_arena), token->length-2);
             dst->string = copy_to_json_string_no_quotes(token, cstr);
-            token       = next_token(parse_state);
+            token       = next_token(&parse_state->token_src);
             break;
         }
         case TOKEN_NULL:
         {
             dst->type = JSON_NULL;
-            token     = next_token(parse_state);
+            token     = next_token(&parse_state->token_src);
             break;
         }
         case TOKEN_OBRACE:
@@ -911,13 +995,13 @@ json_ooa_ptr populate_json_array(json_parse_state *parse_state)
     json_val_ptr start_value_index = alloc_json_values(&parse_state->values_arena, array_ooa->size);
     json_value  *value_ptr         = get_arena_nth_alloc((&parse_state->values_arena), start_value_index, json_value);
 
-    json_token *token = next_token(parse_state);
-    if(array_ooa->size == 0) token = next_token(parse_state); // Consume empty array cbrack
+    json_token *token = next_token(&parse_state->token_src);
+    if(array_ooa->size == 0) token = next_token(&parse_state->token_src); // Consume empty array cbrack
     for(u32 i = 0; i < array_ooa->size; i += 1)
     {
         populate_json_value(value_ptr, parse_state);
         value_ptr += 1;
-        token = next_token(parse_state); // Comma or cbrack
+        token = next_token(&parse_state->token_src); // Comma or cbrack
     }
 
     array_ooa->vals_index = start_value_index;
@@ -934,19 +1018,19 @@ json_ooa_ptr populate_json_object(json_parse_state *parse_state)
     json_string *string_ptr         = get_arena_nth_alloc((&parse_state->keys_arena), start_string_index, json_string);
     json_value  *value_ptr          = get_arena_nth_alloc((&parse_state->values_arena), start_value_index, json_value);
 
-    json_token *token = next_token(parse_state);
-    if(object_ooa->size == 0) token = next_token(parse_state); // Consume empty object cbrace
+    json_token *token = next_token(&parse_state->token_src);
+    if(object_ooa->size == 0) token = next_token(&parse_state->token_src); // Consume empty object cbrace
     for(u32 i = 0; i < object_ooa->size; i += 1)
     {
-        token           = next_token(parse_state); // Key string
+        token           = next_token(&parse_state->token_src); // Key string
         char *key_chars = alloc_json_chars((&parse_state->chars_arena), token->length-2);
         *string_ptr     = copy_to_json_string_no_quotes(token, key_chars);
         string_ptr     += 1;
-        token           = next_token(parse_state); // Colon
+        token           = next_token(&parse_state->token_src); // Colon
 
         populate_json_value(value_ptr, parse_state);
         value_ptr += 1;
-        token = next_token(parse_state); // Comma or cbrace
+        token = next_token(&parse_state->token_src); // Comma or cbrace
     }
 
     object_ooa->keys_index = start_string_index;
@@ -963,19 +1047,19 @@ typedef struct
     json_mem_arena chars_arena;
 } json_parsed;
 
-json_ooa *get_json_ooa(json_parsed *json, u32 index)
+json_ooa *get_json_ooa_addr(json_parsed *json, u32 index)
 {
     json_ooa *ooas = json->ooa_list.ooas;
     return &ooas[index];
 }
 
-json_string *get_json_key(json_parsed *json, u32 index)
+json_string *get_json_key_addr(json_parsed *json, u32 index)
 {
     json_string *keys = (json_string*)json->keys_arena.buffer;
     return &keys[index];
 }
 
-json_value *get_json_value(json_parsed *json, u32 index)
+json_value *get_json_value_addr(json_parsed *json, u32 index)
 {
     json_value *values = (json_value*)json->values_arena.buffer;
     return &values[index];
@@ -990,7 +1074,7 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
     }
     else
     {
-        u32 num_keys   = 0; 
+        u32 num_keys   = 1; 
         u32 num_values = 1;
         for(u32 i = 0; i < parse_state->ooa_list.size; i += 1)
         {
@@ -1017,13 +1101,16 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
         json_val_ptr none_value_index = alloc_json_values(&values_arena, 1);
         json_value *val = get_arena_nth_alloc((&values_arena), none_value_index, json_value);
         val->type = JSON_DOESNT_EXIST;
+        val->ooa  = 1; // Root object index - Useful for returning root when deref'ing non-existant value
 
-        parse_state->num_tokens_parsed = 0;
-        parse_state->num_ooas_parsed   = 0;
+        json_str_ptr none_string_index = alloc_json_values(&keys_arena, 1);
+
+        parse_state->num_ooas_parsed   = 1; // Skip NULL ooa
         parse_state->keys_arena        = keys_arena;
         parse_state->values_arena      = values_arena;
         parse_state->chars_arena       = chars_arena;
         // Needs to fill values, strings and chars memory
+        reset_tokenised_json(&parse_state->token_src);
         populate_json_object(parse_state);
 
         parsed_json.free_mem_base = parsed_buffer;
@@ -1038,7 +1125,7 @@ json_parsed populate_parsed_json(json_parse_state *parse_state)
 json_parsed parse_json(const char *src, u32 src_size)
 {
     json_parse_state parse_state = {0};
-    tokenise_json(&parse_state, src, src_size);
+    tokenise_json_in_parse_state(&parse_state, src, src_size);
 
     // Validate json to make populating object values easier
     validate_json(&parse_state);
@@ -1059,12 +1146,12 @@ void print_indent(u32 indent)
     for(u32 i = 0; i < indent; i += 1) printf("  ");
 }
 
-void print_json_array(u32,json_parsed*,u32,u32);
-void print_json_object(u32,json_parsed*,u32,u32);
+void print_json_array_formatted(u32,json_parsed*,u32,u32);
+void print_json_object_formatted(u32,json_parsed*,u32,u32);
 
-void print_json_value(u32 value_index, json_parsed *parsed_json, u32 indent)
+void print_json_value_formatted(u32 value_index, json_parsed *parsed_json, u32 indent)
 {
-    json_value *value = get_json_value(parsed_json, value_index);
+    json_value *value = get_json_value_addr(parsed_json, value_index);
     switch(value->type)
     {
         case JSON_NUMBER: printf("%f", value->number);       break;
@@ -1076,14 +1163,14 @@ void print_json_value(u32 value_index, json_parsed *parsed_json, u32 indent)
             else               printf("false");
             break;
         }
-        case JSON_OBJECT: print_json_object(value->ooa, parsed_json, indent, indent+2); break;
-        case JSON_ARRAY:  print_json_array(value->ooa, parsed_json, indent, indent+2);  break;
+        case JSON_OBJECT: print_json_object_formatted(value->ooa, parsed_json, indent, indent+2); break;
+        case JSON_ARRAY:  print_json_array_formatted(value->ooa, parsed_json, indent, indent+2);  break;
     }
 }
 
-void print_json_array(u32 array_index, json_parsed *parsed_json, u32 start_column, u32 indent)
+void print_json_array_formatted(u32 array_index, json_parsed *parsed_json, u32 start_column, u32 indent)
 {
-    json_ooa *array = get_json_ooa(parsed_json, array_index);
+    json_ooa *array = get_json_ooa_addr(parsed_json, array_index);
     
     printf("[");
     if(array->size > 0)
@@ -1092,7 +1179,7 @@ void print_json_array(u32 array_index, json_parsed *parsed_json, u32 start_colum
         for(u32 i = 0; i < array->size; i += 1)
         {
             print_indent(indent);
-            print_json_value(array->vals_index+i, parsed_json, indent);
+            print_json_value_formatted(array->vals_index+i, parsed_json, indent);
             if(i < array->size - 1) printf(",");
             printf("\n");
         }
@@ -1101,10 +1188,10 @@ void print_json_array(u32 array_index, json_parsed *parsed_json, u32 start_colum
     printf("]");
 }
 
-void print_json_object(u32 object_index, json_parsed *parsed_json, u32 start_column, u32 indent)
+void print_json_object_formatted(u32 object_index, json_parsed *parsed_json, u32 start_column, u32 indent)
 {
-    json_ooa *object  = get_json_ooa(parsed_json, object_index);
-    json_string *keys = get_json_key(parsed_json, object->keys_index);
+    json_ooa *object  = get_json_ooa_addr(parsed_json, object_index);
+    json_string *keys = get_json_key_addr(parsed_json, object->keys_index);
 
     printf("{");
     if(object->size > 0)
@@ -1115,7 +1202,7 @@ void print_json_object(u32 object_index, json_parsed *parsed_json, u32 start_col
             print_indent(indent);
             print_json_string(keys[i]);
             printf(":");
-            print_json_value(object->vals_index+i, parsed_json, indent);
+            print_json_value_formatted(object->vals_index+i, parsed_json, indent);
             if(i < object->size - 1) printf(",");
             printf("\n");
         }
@@ -1127,8 +1214,21 @@ void print_json_object(u32 object_index, json_parsed *parsed_json, u32 start_col
 void print_json_parsed(json_parsed *parsed_json)
 {
     printf("PARSED\n");
-    print_json_object(0, parsed_json, 0, 2);
+    print_json_object_formatted(1, parsed_json, 0, 2);
     printf("\n");
+}
+
+void print_json_key(u32 key_index, json_parsed *parsed_json)
+{
+    json_string *key = get_json_key_addr(parsed_json, key_index);
+    print_json_string(*key);
+}
+
+void print_json_value(u32 value_index, json_parsed *parsed_json)
+{
+    json_value *value = get_json_value_addr(parsed_json, value_index);
+    printf("("); print_json_value_type_string(value); printf(")");
+    print_json_value_contents(value);
 }
 
 void dealloc_parsed_json(json_parsed parsed_json)
@@ -1138,6 +1238,81 @@ void dealloc_parsed_json(json_parsed parsed_json)
 
 // ============================== Retrieval ===================================
 
-// TODO
+u32 find_json_object_value_by_key(u32 object_index, json_string key, json_parsed *parsed_json)
+{    
+    json_ooa    *object = get_json_ooa_addr(parsed_json, object_index);
+    json_string *keys   = get_json_key_addr(parsed_json, object->keys_index);
+    json_value  *values = get_json_value_addr(parsed_json, object->vals_index);
+
+    for(u32 i = 0; i < object->size; i += 1)
+    {
+        if(json_string_eq(key, keys[i]))
+        {
+            return object->vals_index + i;
+        }
+    }
+    return 0; // TODO: Non-exist macro/constant? (e.g. define NON_EXIST 0)
+}
+
+u32 get_json_value(u32 ooa_index, u32 value_offset, json_parsed *parsed_json)
+{
+    // TODO: Bounds check
+    json_ooa *ooa = get_json_ooa_addr(parsed_json, ooa_index);
+    return ooa->vals_index + value_offset;
+}
+
+u32 find_json_value(u32 object_index, json_string value_string, json_parsed *parsed_json)
+{
+    return find_json_object_value_by_key(object_index, value_string, parsed_json);
+}
+
+u32 find_root_json_object(json_parsed *parsed_json)
+{
+    return 1;
+}
+
+u8 json_value_exists(u32 value_index)
+{
+    return value_index != 0;
+}
+
+u32 get_num_json_values(u32 ooa_index, json_parsed *parsed_json)
+{
+    json_ooa *ooa = get_json_ooa_addr(parsed_json, ooa_index);
+    return ooa->size;
+}
+
+u32 get_json_object_key(u32 object_index, u32 key_offset, json_parsed *parsed_json)
+{
+    json_ooa *object = get_json_ooa_addr(parsed_json, object_index);
+    return object->keys_index + key_offset;
+}
+
+void *get_json_value_base(u32 value_index, json_parsed *parsed_json)
+{
+    json_value *value = get_json_value_addr(parsed_json, value_index);
+    return (void*)&value->base;
+}
+
+#define get_json_value_typed(val, parsed, type) *(type*)get_json_value_base(val, parsed)
+
+#define get_json_value_number(val, parsed) get_json_value_typed(val, parsed, f64)
+#define get_json_value_bool(val, parsed)   get_json_value_typed(val, parsed, u8)
+#define get_json_value_string(val, parsed) get_json_value_typed(val, parsed, json_string)
+#define get_json_value_object(val, parsed) get_json_value_typed(val, parsed, json_ooa_ptr)
+#define get_json_value_array(val, parsed)  get_json_value_typed(val, parsed, json_ooa_ptr)
+
+u8 is_json_value_type(u32 value_index, json_type type, json_parsed *parsed_json)
+{
+    json_value *value = get_json_value_addr(parsed_json, value_index);
+    return value->type == type;
+}
+
+#define is_json_value_number(val, parsed) is_json_value_type(val, JSON_NUMBER, parsed)
+#define is_json_value_bool(val, parsed)   is_json_value_type(val, JSON_BOOL,   parsed)
+#define is_json_value_null(val, parsed)   is_json_value_type(val, JSON_NULL,   parsed)
+#define is_json_value_string(val, parsed) is_json_value_type(val, JSON_STRING, parsed)
+#define is_json_value_object(val, parsed) is_json_value_type(val, JSON_OBJECT, parsed)
+#define is_json_value_array(val, parsed)  is_json_value_type(val, JSON_ARRAY,  parsed)
 
 #endif
